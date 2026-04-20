@@ -107,37 +107,73 @@ def _handle_new(reservation: dict) -> bool:
         logger.warning("[신규] checkin/checkout 누락 — skip: %s/%s", platform, booking_id)
         return False
 
+    checkin_str = checkin.isoformat() if hasattr(checkin, 'isoformat') else checkin
+
+    # 에어비앤비: 웹훅으로 임시 저장된 건이 있으면 정식 처리로 업그레이드
+    existing_pending = None
+    if platform == "airbnb":
+        with get_connection() as conn:
+            cur = conn.execute(
+                "SELECT booking_id FROM reservations "
+                "WHERE platform = 'airbnb' AND checkin = ? AND status = 'confirmed' "
+                "  AND google_event_id_a IS NULL AND guest_name IN ('확인필요', '?', '')",
+                (checkin_str,),
+            )
+            row = cur.fetchone()
+            if row:
+                existing_pending = row["booking_id"]
+
     # a) 구글 캘린더 A/B 일정 생성
     cal_ids = calendar.create_events(reservation)
 
-    # b) DB INSERT (동일 booking_id 중복 삽입 방지 위해 OR IGNORE)
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO reservations
-                (platform, booking_id, guest_name, guests,
-                 checkin, checkout, status,
-                 google_event_id_a, google_event_id_b)
-            VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)
-            """,
-            (
-                platform,
-                booking_id,
-                reservation.get("guest_name"),
-                reservation.get("guests"),
-                reservation["checkin"].isoformat(),
-                reservation["checkout"].isoformat(),
-                cal_ids.get("google_a"),
-                cal_ids.get("google_b"),
-            ),
-        )
-        conn.commit()
+    if existing_pending:
+        # 임시 저장 건 업그레이드
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE reservations SET
+                    guest_name = ?, guests = ?, checkout = ?,
+                    google_event_id_a = ?, google_event_id_b = ?
+                WHERE booking_id = ?
+                """,
+                (
+                    reservation.get("guest_name"),
+                    reservation.get("guests"),
+                    reservation["checkout"].isoformat(),
+                    cal_ids.get("google_a"),
+                    cal_ids.get("google_b"),
+                    existing_pending,
+                ),
+            )
+            conn.commit()
+        logger.info("[신규] 임시 저장 업그레이드: %s → %s", existing_pending, reservation.get("guest_name"))
+    else:
+        # b) DB INSERT (동일 booking_id 중복 삽입 방지 위해 OR IGNORE)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO reservations
+                    (platform, booking_id, guest_name, guests,
+                     checkin, checkout, status,
+                     google_event_id_a, google_event_id_b)
+                VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)
+                """,
+                (
+                    platform,
+                    booking_id,
+                    reservation.get("guest_name"),
+                    reservation.get("guests"),
+                    checkin_str,
+                    reservation["checkout"].isoformat(),
+                    cal_ids.get("google_a"),
+                    cal_ids.get("google_b"),
+                ),
+            )
+            conn.commit()
 
     # c) 반대 플랫폼 차단
     if platform == "naver":
         blocker.block_airbnb(reservation)
-    elif platform == "airbnb":
-        blocker.block_naver(reservation)
 
     # d) 카카오 알림
     notifier.send_notification(reservation, "created")
@@ -370,8 +406,17 @@ def _update_reservations_from_gmail() -> int:
         final_name = updates.get("guest_name", old_name)
         final_guests = updates.get("guests", row["guests"])
 
+        from modules.detector import _to_date
+        ci = _to_date(row["checkin"])
+        co = _to_date(row["checkout"])
+        nights = (co - ci).days if ci and co else 1
+        staff_name = config.get("staff_name", "")
+
         summary_a = f"{prefix}. {final_name}. {final_guests}인"
-        summary_b = f"{config.get('staff_name', '')} / {final_guests}인"
+        if nights > 1:
+            summary_b = f"{staff_name} / 성인 {final_guests}명 (연박{nights}배)"
+        else:
+            summary_b = f"{staff_name} / 성인 {final_guests}명"
 
         calendar.update_event_summary(row["google_event_id_a"], owner_cal, summary_a)
         calendar.update_event_summary(row["google_event_id_b"], staff_cal, summary_b)

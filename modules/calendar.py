@@ -174,15 +174,25 @@ def create_events(reservation: dict) -> dict:
         logger.error("[Calendar] 유효하지 않은 checkin/checkout: %s / %s", checkin, checkout)
         return result
 
+    nights = (checkout - checkin).days
     summary_a = f"{prefix}. {guest_name}. {guests_str}인"
-    summary_b = f"{config.get('staff_name', '')} / {guests_str}인"
+    staff_name = config.get("staff_name", "")
+    if nights > 1:
+        summary_b = f"{staff_name} / 성인 {guests_str}명 (연박{nights}배)"
+    else:
+        summary_b = f"{staff_name} / 성인 {guests_str}명"
+
     owner_cal = config.get("naver_owner_calendar", "")
     staff_cal = config.get("naver_staff_calendar", "")
+
+    # 캘린더 B: 체크인 당일 하루만
+    from datetime import timedelta
+    checkin_one_day = checkin + timedelta(days=1)
 
     try:
         gsvc = _get_google_calendar_service()
         result["google_a"] = _create_google_event(gsvc, owner_cal, summary_a, checkin, checkout)
-        result["google_b"] = _create_google_event(gsvc, staff_cal, summary_b, checkin, checkout)
+        result["google_b"] = _create_google_event(gsvc, staff_cal, summary_b, checkin, checkin_one_day)
     except Exception as e:
         logger.error("[Google] 캘린더 서비스 초기화 실패: %s", e)
 

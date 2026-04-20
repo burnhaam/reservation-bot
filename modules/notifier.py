@@ -303,16 +303,72 @@ def _send_kakao_message(text: str) -> bool:
     return False
 
 
+def _is_english_name(name: str) -> bool:
+    """영문 이름 여부 확인."""
+    import re
+    return bool(re.search(r"[a-zA-Z]", name))
+
+
+def _convert_english_to_korean(name: str) -> Optional[str]:
+    """Gemini API로 영문 이름을 한국어로 변환."""
+    if genai is None:
+        return None
+
+    env = load_env()
+    api_key = env.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return None
+
+    prompt = (
+        "다음 영문 이름을 한국어로 변환해줘.\n"
+        "성은 뒤로, 이름은 앞으로 (한국식 순서).\n"
+        "이름만 출력하고 설명 붙이지 마.\n"
+        f"예: junyeon hwang → 황준연\n\n"
+        f"{name}"
+    )
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            config={"max_output_tokens": 50, "temperature": 0.1, "thinking_config": {"thinking_budget": 0}},
+            contents=prompt,
+        )
+        result = response.text.strip()
+        import re
+        if re.match(r'^[가-힣]{2,5}$', result):
+            return result
+        match = re.search(r'([가-힣]{2,5})', result)
+        return match.group(1) if match else None
+    except Exception as e:
+        logger.error("[3행시] 영문→한국어 변환 실패: %s", e)
+        return None
+
+
 def send_samhaengsi(name: str) -> None:
     """이름으로 3행시를 생성하고 카카오톡으로 전송."""
-    poem = _generate_samhaengsi(name)
+    original_name = name
+    korean_name = name
+
+    if _is_english_name(name):
+        converted = _convert_english_to_korean(name)
+        if converted:
+            korean_name = converted
+            logger.info("[3행시] 영문→한국어 변환: %s → %s", name, korean_name)
+        else:
+            logger.warning("[3행시] 영문→한국어 변환 실패, 원본 사용: %s", name)
+
+    poem = _generate_samhaengsi(korean_name)
     if not poem:
-        logger.error("[3행시] 생성 실패: %s", name)
+        logger.error("[3행시] 생성 실패: %s", korean_name)
         return
 
-    message = f"오늘 3행시 송부드립니다.🎉\n\n{poem}"
+    if _is_english_name(original_name) and korean_name != original_name:
+        message = f"오늘 3행시 송부드립니다.🎉\n{original_name} ({korean_name})님\n\n{poem}"
+    else:
+        message = f"오늘 3행시 송부드립니다.🎉\n\n{poem}"
 
     if _send_kakao_message(message):
-        logger.info("[3행시] 전송 OK: %s", name)
+        logger.info("[3행시] 전송 OK: %s", korean_name)
     else:
-        logger.error("[3행시] 카카오톡 전송 실패: %s", name)
+        logger.error("[3행시] 카카오톡 전송 실패: %s", korean_name)

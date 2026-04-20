@@ -202,12 +202,14 @@ def _try_update_guest_name(reservation: dict) -> Optional[dict]:
 def _handle_new_reservation(reservation: dict) -> dict:
     booking_id = reservation["booking_id"]
     platform = reservation["platform"]
+    checkin_str = reservation["checkin"].isoformat()
 
     # 동일 날짜에 이름이 없는 기존 예약이 있으면 이름만 업데이트
     name_update = _try_update_guest_name(reservation)
     if name_update:
         return name_update
 
+    # 동일 booking_id 중복 체크
     with get_connection() as conn:
         cur = conn.execute(
             "SELECT id FROM reservations WHERE booking_id = ?", (booking_id,)
@@ -215,6 +217,44 @@ def _handle_new_reservation(reservation: dict) -> dict:
         if cur.fetchone():
             return {"status": "skip", "reason": "already_processed", "booking_id": booking_id}
 
+    # 에어비앤비: 같은 체크인 날짜에 이미 Gmail로 처리된 예약이 있으면 skip
+    if platform == "airbnb":
+        with get_connection() as conn:
+            cur = conn.execute(
+                "SELECT id FROM reservations "
+                "WHERE platform = 'airbnb' AND checkin = ? AND status = 'confirmed'",
+                (checkin_str,),
+            )
+            if cur.fetchone():
+                return {"status": "skip", "reason": "already_processed_by_gmail", "checkin": checkin_str}
+
+        # Gmail로 아직 처리 안 됨 → 임시 저장 (캘린더 미생성)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO reservations
+                    (platform, booking_id, guest_name, guests,
+                     checkin, checkout, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
+                """,
+                (
+                    platform,
+                    booking_id,
+                    "확인필요",
+                    reservation.get("guests"),
+                    checkin_str,
+                    reservation["checkout"].isoformat(),
+                ),
+            )
+            conn.commit()
+
+        notifier._send_kakao_message(
+            "[에어비앤비 예약 감지] 메일 확인 후 자동 처리됩니다 (최대 5분)"
+        )
+        logger.info("[Webhook] 에어비앤비 임시 저장: %s (Gmail 대기)", booking_id)
+        return {"status": "ok", "action": "pending_gmail", "booking_id": booking_id}
+
+    # 네이버: 즉시 전체 처리
     cal_ids = calendar.create_events(reservation)
 
     with get_connection() as conn:
@@ -231,7 +271,7 @@ def _handle_new_reservation(reservation: dict) -> dict:
                 booking_id,
                 reservation.get("guest_name"),
                 reservation.get("guests"),
-                reservation["checkin"].isoformat(),
+                checkin_str,
                 reservation["checkout"].isoformat(),
                 cal_ids.get("google_a"),
                 cal_ids.get("google_b"),
@@ -239,9 +279,7 @@ def _handle_new_reservation(reservation: dict) -> dict:
         )
         conn.commit()
 
-    if platform == "naver":
-        blocker.block_airbnb(reservation)
-
+    blocker.block_airbnb(reservation)
     notifier.send_notification(reservation, "created")
 
     logger.info("[Webhook] 신규 예약 처리 완료: %s/%s", platform, booking_id)

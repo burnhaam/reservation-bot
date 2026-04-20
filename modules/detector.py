@@ -255,19 +255,34 @@ def detect_airbnb() -> list[dict]:
 
     results: list[dict] = []
 
+    # 체크인 날짜 → booking_id 매핑 (웹훅 임시 저장 건 포함)
+    known_by_checkin: dict[str, str] = {}
+    for kid, krow in known.items():
+        ci = krow.get("checkin", "")
+        if ci and krow.get("status") != "cancelled":
+            known_by_checkin[ci] = kid
+
     # 신규: iCal에 있지만 DB에 없음
     for event in current_events:
-        if event["booking_id"] not in known:
-            guest_name = event.get("guest_name")
-            if not guest_name or guest_name == "Reserved":
-                gmail_info = _extract_airbnb_info_from_gmail(event.get("checkin"))
-                if gmail_info:
-                    event["guest_name"] = gmail_info.get("guest_name", "(예약됨)")
-                    if gmail_info.get("guests") is not None:
-                        event["guests"] = gmail_info["guests"]
-                else:
-                    event["guest_name"] = "(예약됨)"
-            results.append({"platform": "airbnb", "action": "new", **event})
+        checkin_str = event["checkin"].isoformat() if event.get("checkin") else ""
+
+        # booking_id로 이미 DB에 있으면 skip
+        if event["booking_id"] in known:
+            continue
+        # 같은 체크인 날짜에 이미 처리된 건 있으면 skip (웹훅 임시 저장 건은 main.py에서 업그레이드)
+        if checkin_str in known_by_checkin:
+            continue
+
+        guest_name = event.get("guest_name")
+        if not guest_name or guest_name == "Reserved":
+            gmail_info = _extract_airbnb_info_from_gmail(event.get("checkin"))
+            if gmail_info:
+                event["guest_name"] = gmail_info.get("guest_name", "(예약됨)")
+                if gmail_info.get("guests") is not None:
+                    event["guests"] = gmail_info["guests"]
+            else:
+                event["guest_name"] = "(예약됨)"
+        results.append({"platform": "airbnb", "action": "new", **event})
 
     # 취소: DB에 있지만 iCal에서 사라짐 (이미 취소 처리된 건 제외)
     for booking_id, row in known.items():
