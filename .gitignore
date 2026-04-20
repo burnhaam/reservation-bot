@@ -1,10 +1,31 @@
+# 인증 정보
 .env
+*.env
+!.env.example
+token*.json
 token_gmail.json
 token_calendar.json
-token.json
 credentials.json
+client_secret*.json
+
+# DB (예약자 개인정보 포함)
 db/reservations.db
+*.db
+*.sqlite
+
+# 로그 (예약 정보 포함될 수 있음)
 logs/
+*.log
+
+# iCal (예약 날짜 정보)
+ical/blocked.ics
+
+# Python 캐시
 __pycache__/
 *.pyc
+*.pyo
+
+# 기타
 ngrok.exe
+.DS_Store
+Thumbs.db
