@@ -248,9 +248,6 @@ def _handle_new_reservation(reservation: dict) -> dict:
             )
             conn.commit()
 
-        notifier._send_kakao_message(
-            "[에어비앤비 예약 감지] 메일 확인 후 자동 처리됩니다 (최대 5분)"
-        )
         logger.info("[Webhook] 에어비앤비 임시 저장: %s (Gmail 대기)", booking_id)
         return {"status": "ok", "action": "pending_gmail", "booking_id": booking_id}
 
@@ -343,12 +340,8 @@ _error_logger.addHandler(_error_handler)
 
 
 def _notify_error(summary: str) -> None:
-    """오류를 error 로그에 기록하고 카카오톡으로 알림."""
+    """오류를 error 로그에 기록."""
     _error_logger.exception(summary)
-    try:
-        notifier._send_kakao_message(f"[웹훅 오류] {summary[:100]}")
-    except Exception:
-        pass
 
 
 # =============================================================

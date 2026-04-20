@@ -12,7 +12,12 @@
       "Bash(pip install *)",
       "Bash(PYTHONUTF8=1 python watchdog.py)",
       "Bash(taskkill //f //im pythonw.exe)",
-      "Bash(taskkill //f //im python.exe)"
+      "Bash(taskkill //f //im python.exe)",
+      "Bash(grep -iE \"\\(^|/\\)\\(\\\\.env$|.*\\\\.env$|token.*\\\\.json$|credentials\\\\.json$|client_secret.*\\\\.json$|.*\\\\.db$|.*\\\\.sqlite$|.*\\\\.log$|.*\\\\.pyc$|.*\\\\.pyo$|ngrok\\\\.exe$|\\\\.DS_Store$|Thumbs\\\\.db$\\)|^\\(logs|__pycache__\\)/|^ical/blocked\\\\.ics$\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }

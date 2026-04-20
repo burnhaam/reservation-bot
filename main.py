@@ -178,13 +178,6 @@ def _handle_new(reservation: dict) -> bool:
     # d) 카카오 알림
     notifier.send_notification(reservation, "created")
 
-    # e) 이름 확인 필요 알림
-    guest_name = reservation.get("guest_name", "")
-    if guest_name == "확인필요":
-        notifier._send_kakao_message(
-            "[이름 확인 필요] 네이버 예약 감지됨. 스마트플레이스에서 이름 확인해주세요."
-        )
-
     logger.info("[신규] %s/%s 처리 완료", platform, booking_id)
     return True
 
@@ -430,8 +423,6 @@ def _update_reservations_from_gmail() -> int:
             )
             conn.commit()
 
-        if "guests" in updates:
-            notifier.send_guests_update(final_name, base_guests, final_guests)
         logger.info("[업데이트] %s/%s: %s", platform, final_name, updates)
         updated += 1
 
