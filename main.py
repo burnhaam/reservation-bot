@@ -228,6 +228,31 @@ def _handle_cancel(reservation: dict) -> bool:
 
 
 # =============================================================
+# 24시간 미해결 알림
+# =============================================================
+
+def _alert_stale_reservations() -> None:
+    """24시간 이상 이름/인원 미확인 예약이 있으면 카카오 알림."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT booking_id, guest_name, checkin, created_at FROM reservations "
+            "WHERE status = 'confirmed' "
+            "  AND (guest_name IN ('?', '', '확인필요', '(예약됨)') OR google_event_id_a IS NULL) "
+            "  AND created_at <= datetime('now', '-24 hours')"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return
+
+    names = ", ".join(f"{r['checkin']} {r['guest_name']}" for r in rows[:5])
+    notifier._send_kakao_message(
+        f"[미처리 예약 {len(rows)}건] 24시간 경과, 수동 확인 필요: {names}"
+    )
+    logger.warning("[알림] 24시간 미처리 예약 %d건: %s", len(rows), names)
+
+
+# =============================================================
 # cancelled 예약의 잔여 캘린더 일정 정리
 # =============================================================
 
@@ -490,6 +515,12 @@ def run_pipeline() -> int:
     except Exception:
         stat_cleanup = 0
         logger.exception("캘린더 정리 중 예외")
+
+    # 24시간 미해결 예약 알림
+    try:
+        _alert_stale_reservations()
+    except Exception:
+        logger.exception("미해결 예약 알림 중 예외")
 
     # blocked.ics GitHub 동기화 확인
     try:

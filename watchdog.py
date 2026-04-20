@@ -92,29 +92,53 @@ def _send_kakao_alert(message: str) -> None:
         logger.error("[Watchdog] 카카오 알림 실패: %s", e)
 
 
+_FAIL_COUNT_FILE = LOG_DIR / "watchdog_fails.json"
+
+
+def _load_fail_counts() -> dict:
+    import json
+    if _FAIL_COUNT_FILE.exists():
+        try:
+            return json.loads(_FAIL_COUNT_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_fail_counts(counts: dict) -> None:
+    import json
+    _FAIL_COUNT_FILE.write_text(json.dumps(counts))
+
+
 def main():
+    fail_counts = _load_fail_counts()
+    # 5분 간격 × 288 = 24시간
+    ALERT_THRESHOLD = 288
+
     for target in TARGETS:
         name = target["name"]
         if _is_alive(target["health"]):
             logger.info("[Watchdog] %s OK (port %d)", name, target["port"])
+            fail_counts[name] = 0
             continue
 
-        logger.warning("[Watchdog] %s 응답 없음 — 재시작 시도", name)
+        fail_counts[name] = fail_counts.get(name, 0) + 1
+        logger.warning("[Watchdog] %s 응답 없음 (연속 %d회) — 재시작 시도", name, fail_counts[name])
 
         if _start_process(target["script"]):
             import time
             time.sleep(3)
 
             if _is_alive(target["health"]):
-                msg = f"[시스템 알림] {name} 재시작됨 ✅"
                 logger.info("[Watchdog] %s 재시작 성공", name)
+                fail_counts[name] = 0
             else:
-                msg = f"[시스템 알림] {name} 재시작 실패 ❌"
                 logger.error("[Watchdog] %s 재시작 후에도 응답 없음", name)
 
-            _send_kakao_alert(msg)
-        else:
-            _send_kakao_alert(f"[시스템 알림] {name} 시작 실패 ❌")
+        if fail_counts[name] == ALERT_THRESHOLD:
+            _send_kakao_alert(f"[서버 장애] {name} 24시간 이상 복구 불가, 수동 확인 필요")
+
+    _save_fail_counts(fail_counts)
 
 
 if __name__ == "__main__":

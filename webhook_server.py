@@ -424,10 +424,6 @@ if __name__ == "__main__":
 
     while True:
         try:
-            try:
-                notifier._send_kakao_message("[웹훅 서버 시작] 정상 실행 중")
-            except Exception:
-                pass
             logger.info("[Webhook] 서버 시작: http://0.0.0.0:5000")
             app.run(host="0.0.0.0", port=5000, debug=False)
         except KeyboardInterrupt:
@@ -435,9 +431,5 @@ if __name__ == "__main__":
             break
         except Exception as e:
             logger.exception("[Webhook] 서버 비정상 종료: %s", e)
-            try:
-                notifier._send_kakao_message(f"[웹훅 서버 재시작] 예기치 않은 종료 후 재시작됨: {e}")
-            except Exception:
-                pass
             logger.info("[Webhook] 5초 후 재시작...")
             time.sleep(5)
