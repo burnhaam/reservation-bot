@@ -1,0 +1,29 @@
+# HTTP 요청 (네이버/카카오 API 호출용)
+requests>=2.31.0
+
+# 환경변수 로드 (.env)
+python-dotenv>=1.0.0
+
+# 에어비앤비 iCal 파싱 및 생성
+icalendar>=5.0.7
+
+# 날짜/시간 파싱 및 타임존 처리
+python-dateutil>=2.8.2
+pytz>=2024.1
+
+# 스케줄러 (폴링 주기 실행)
+schedule>=1.2.1
+
+# 웹훅 수신 서버
+flask>=3.0.0
+
+# Gemini API (3행시 생성)
+google-genai>=1.0.0
+
+# 프로세스 감시 (워치독)
+psutil>=5.9.0
+
+# Gmail API (네이버 예약 알림 메일 파싱용)
+google-api-python-client>=2.120.0
+google-auth>=2.28.0
+google-auth-oauthlib>=1.2.0

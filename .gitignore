@@ -1,0 +1,10 @@
+.env
+token_gmail.json
+token_calendar.json
+token.json
+credentials.json
+db/reservations.db
+logs/
+__pycache__/
+*.pyc
+ngrok.exe

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(PYTHONUTF8=1 python main.py --check)",
+      "Bash(PYTHONUTF8=1 python webhook_server.py)",
+      "Bash(PYTHONUTF8=1 python main.py)",
+      "Bash(powershell -Command \"Get-ScheduledTask | Format-Table TaskName, State -AutoSize\")",
+      "Bash(curl *)",
+      "Bash(powershell *)",
+      "Bash(pip list *)",
+      "Bash(pip install *)",
+      "Bash(PYTHONUTF8=1 python watchdog.py)",
+      "Bash(taskkill //f //im pythonw.exe)",
+      "Bash(taskkill //f //im python.exe)"
+    ]
+  }
+}

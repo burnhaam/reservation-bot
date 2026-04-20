@@ -1,0 +1,13 @@
+{
+  "staff_name": "최자임님",
+  "polling_interval_minutes": 5,
+  "naver_owner_calendar": "소유 일정관리",
+  "naver_staff_calendar": "소캠스 예약일정",
+  "platform_prefix": {
+    "naver": "네",
+    "airbnb": "에"
+  },
+  "blocked_ical_path": "ical/blocked.ics",
+  "naver_block_method": "api",
+  "base_guests": 2
+}
