@@ -512,3 +512,125 @@ def detect_naver() -> list[dict]:
 def detect_new_reservations() -> list[dict]:
     """에어비앤비 + 네이버의 신규/취소 예약을 합쳐서 반환."""
     return detect_airbnb() + detect_naver()
+
+
+# =============================================================
+# 에어비앤비 예약 변경 감지
+# =============================================================
+
+def _resolve_date_safe(month: int, day: int) -> Optional[date]:
+    """월/일로 date 생성."""
+    year = date.today().year
+    try:
+        candidate = date(year, month, day)
+    except ValueError:
+        return None
+    if (date.today() - candidate).days > 180:
+        candidate = date(year + 1, month, day)
+    return candidate
+
+
+def _parse_full_date(text: str) -> Optional[date]:
+    """'2026년 5월 23일' 형식 파싱."""
+    match = re.search(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def detect_airbnb_modifications() -> list[dict]:
+    """Gmail에서 에어비앤비 예약 변경 요청/확정 메일을 감지.
+
+    반환: [{"type": "request"|"confirmed", "guest_name": str,
+            "new_checkin": date|None, "new_checkout": date|None}, ...]
+    """
+    try:
+        service = _get_gmail_service()
+    except Exception:
+        return []
+
+    results: list[dict] = []
+
+    # 1단계: 변경 요청 메일 — 날짜 정보 포함
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q='from:automated@airbnb.com subject:"변경을 요청" newer_than:1d',
+            maxResults=10,
+        ).execute()
+        for ref in resp.get("messages", []):
+            msg = service.users().messages().get(
+                userId="me", id=ref["id"], format="full"
+            ).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            subject = headers.get("Subject", "")
+            body = _decode_gmail_body(msg["payload"])
+
+            name_match = re.search(r"(\S+?)님이\s*예약\s*변경", subject)
+            guest_name = name_match.group(1) if name_match else None
+
+            # 본문에서 날짜 쌍 추출: 기존(1,2번째) + 요청(3,4번째)
+            full_dates = re.findall(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", body)
+            old_checkin = None
+            new_checkin = None
+            new_checkout = None
+            if len(full_dates) >= 4:
+                y, m, d = full_dates[0]
+                old_checkin = _resolve_date_safe(int(m), int(d))
+                y, m, d = full_dates[2]
+                new_checkin = _resolve_date_safe(int(m), int(d))
+                y, m, d = full_dates[3]
+                new_checkout = _resolve_date_safe(int(m), int(d))
+            elif len(full_dates) >= 2:
+                y, m, d = full_dates[-2]
+                new_checkin = _resolve_date_safe(int(m), int(d))
+                y, m, d = full_dates[-1]
+                new_checkout = _resolve_date_safe(int(m), int(d))
+
+            if guest_name:
+                results.append({
+                    "type": "request",
+                    "guest_name": guest_name,
+                    "old_checkin": old_checkin,
+                    "new_checkin": new_checkin,
+                    "new_checkout": new_checkout,
+                })
+                logger.info("[Airbnb] 변경 요청 감지: %s → %s~%s", guest_name, new_checkin, new_checkout)
+    except Exception as e:
+        logger.warning("[Airbnb] 변경 요청 메일 조회 실패: %s", e)
+
+    # 2단계: 변경 확정 메일 — 날짜 정보 없음, pending에서 가져옴
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q='from:automated@airbnb.com (subject:"예약이 변경되었습니다" OR subject:"예약 변경 완료") newer_than:1d',
+            maxResults=10,
+        ).execute()
+        for ref in resp.get("messages", []):
+            msg = service.users().messages().get(
+                userId="me", id=ref["id"], format="metadata",
+                metadataHeaders=["Subject"],
+            ).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            subject = headers.get("Subject", "")
+
+            if "요청" in subject:
+                continue
+
+            name_match = re.search(r"(\S+?)님의\s*예약이\s*변경", subject)
+            if not name_match:
+                name_match = re.search(r"예약\s*변경\s*완료", subject)
+            guest_name = name_match.group(1) if name_match and name_match.lastindex else None
+
+            results.append({
+                "type": "confirmed",
+                "guest_name": guest_name,
+            })
+            logger.info("[Airbnb] 변경 확정 감지: %s", guest_name or "이름 미확인")
+    except Exception as e:
+        logger.warning("[Airbnb] 변경 확정 메일 조회 실패: %s", e)
+
+    return results

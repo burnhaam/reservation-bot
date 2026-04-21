@@ -409,9 +409,18 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.errorhandler(404)
+def handle_404(e):
+    logger.info("[Webhook] 404: %s %s", request.method, request.path)
+    return jsonify({"status": "error", "reason": "not_found", "path": request.path}), 404
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
-    _notify_error(f"전역 예외: {e}")
+    from werkzeug.exceptions import NotFound
+    if isinstance(e, NotFound):
+        return handle_404(e)
+    _error_logger.exception("전역 예외: %s", e)
     return jsonify({"status": "error", "reason": str(e)}), 200
 
 

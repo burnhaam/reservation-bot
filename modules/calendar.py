@@ -229,6 +229,42 @@ def update_event_summary(
         return False
 
 
+def update_event_dates(
+    google_event_id: Optional[str],
+    calendar_name: str,
+    new_checkin: date,
+    new_checkout: date,
+    new_summary: Optional[str] = None,
+) -> bool:
+    """구글 캘린더 일정 날짜(+제목) 업데이트."""
+    if not google_event_id:
+        return False
+
+    try:
+        gsvc = _get_google_calendar_service()
+    except Exception as e:
+        logger.error("[Google] 서비스 초기화 실패: %s", e)
+        return False
+
+    cal_id = _resolve_google_calendar_id(gsvc, calendar_name)
+    if not cal_id:
+        return False
+
+    try:
+        event = gsvc.events().get(calendarId=cal_id, eventId=google_event_id).execute()
+        event["start"] = {"date": new_checkin.isoformat()}
+        event["end"] = {"date": new_checkout.isoformat()}
+        if new_summary:
+            event["summary"] = new_summary
+        gsvc.events().update(calendarId=cal_id, eventId=google_event_id, body=event).execute()
+        logger.info("[Google] 일정 날짜 업데이트 OK (calendar=%s, %s~%s)",
+                     calendar_name, new_checkin, new_checkout)
+        return True
+    except Exception as e:
+        logger.error("[Google] 일정 날짜 업데이트 실패 (calendar=%s): %s", calendar_name, e)
+        return False
+
+
 def delete_events(
     google_event_id_a: Optional[str] = None,
     google_event_id_b: Optional[str] = None,

@@ -228,17 +228,279 @@ def _handle_cancel(reservation: dict) -> bool:
 
 
 # =============================================================
+# 에어비앤비 예약 변경 처리
+# =============================================================
+
+def _handle_airbnb_modifications() -> int:
+    """에어비앤비 예약 변경 2단계 처리."""
+    modifications = detector.detect_airbnb_modifications()
+    if not modifications:
+        return 0
+
+    config = load_config()
+    owner_cal = config.get("naver_owner_calendar", "")
+    staff_cal = config.get("naver_staff_calendar", "")
+    processed = 0
+
+    for mod in modifications:
+        guest_name = mod.get("guest_name")
+        if not guest_name:
+            continue
+
+        # DB에서 예약 조회 (이름 + 기존 체크인 날짜로 정확 매칭)
+        old_checkin_hint = mod.get("old_checkin")
+        with get_connection() as conn:
+            if old_checkin_hint:
+                cur = conn.execute(
+                    "SELECT booking_id, checkin, checkout, guests, "
+                    "       google_event_id_a, google_event_id_b, "
+                    "       pending_checkin, pending_checkout "
+                    "FROM reservations "
+                    "WHERE platform = 'airbnb' AND status = 'confirmed' "
+                    "  AND guest_name LIKE ? AND checkin = ?",
+                    (f"%{guest_name}%", old_checkin_hint.isoformat()),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT booking_id, checkin, checkout, guests, "
+                    "       google_event_id_a, google_event_id_b, "
+                    "       pending_checkin, pending_checkout "
+                    "FROM reservations "
+                    "WHERE platform = 'airbnb' AND status = 'confirmed' "
+                    "  AND guest_name LIKE ?",
+                    (f"%{guest_name}%",),
+                )
+            row = cur.fetchone()
+
+        if not row:
+            logger.warning("[변경] DB에서 %s 예약 못 찾음", guest_name)
+            continue
+
+        bid = row["booking_id"]
+
+        # --- 1단계: 변경 요청 → pending에 날짜 저장 ---
+        if mod["type"] == "request":
+            new_ci = mod.get("new_checkin")
+            new_co = mod.get("new_checkout")
+            if not new_ci:
+                continue
+
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE reservations SET pending_checkin = ?, pending_checkout = ? "
+                    "WHERE booking_id = ?",
+                    (new_ci.isoformat(), new_co.isoformat() if new_co else None, bid),
+                )
+                conn.commit()
+
+            logger.info("[변경 요청] %s: pending %s~%s 저장", guest_name, new_ci, new_co)
+            processed += 1
+            continue
+
+        # --- 2단계: 변경 확정 → pending에서 실제 반영 ---
+        if mod["type"] == "confirmed":
+            pending_ci = row["pending_checkin"]
+            pending_co = row["pending_checkout"]
+
+            if not pending_ci:
+                logger.warning("[변경 확정] %s: pending 날짜 없음 — skip", guest_name)
+                continue
+
+            from modules.detector import _to_date
+            new_checkin = _to_date(pending_ci)
+            new_checkout = _to_date(pending_co) if pending_co else new_checkin
+            if not new_checkin:
+                continue
+
+            old_checkin = row["checkin"]
+            old_checkout = row["checkout"]
+            nights = (new_checkout - new_checkin).days
+
+            # 캘린더 A: 전체 기간
+            calendar.update_event_dates(
+                row["google_event_id_a"], owner_cal, new_checkin, new_checkout
+            )
+
+            # 캘린더 B: 체크인 하루 + 연박 제목
+            staff_name = config.get("staff_name", "")
+            guests_str = str(row["guests"] or 2)
+            if nights > 1:
+                summary_b = f"{staff_name} / 성인 {guests_str}명 (연박{nights}배)"
+            else:
+                summary_b = f"{staff_name} / 성인 {guests_str}명"
+            calendar.update_event_dates(
+                row["google_event_id_b"], staff_cal,
+                new_checkin, new_checkin + timedelta(days=1), summary_b
+            )
+
+            # DB 업데이트 + pending 초기화
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE reservations SET checkin = ?, checkout = ?, "
+                    "  pending_checkin = NULL, pending_checkout = NULL "
+                    "WHERE booking_id = ?",
+                    (new_checkin.isoformat(), new_checkout.isoformat(), bid),
+                )
+                conn.commit()
+
+            # 카카오 알림
+            notifier._send_kakao_message(
+                f"[예약 변경 확정] {guest_name}님\n"
+                f"📅 기존: {old_checkin}~{old_checkout}\n"
+                f"📅 변경: {new_checkin}~{new_checkout}\n"
+                "✅ 캘린더 업데이트 완료\n"
+                "⚠️ 네이버 플레이스 수동 차단 해제 필요"
+            )
+
+            logger.info("[변경 확정] %s: %s~%s → %s~%s",
+                        guest_name, old_checkin, old_checkout, new_checkin, new_checkout)
+            processed += 1
+
+    return processed
+
+
+# =============================================================
+# 48시간 pending 자동 초기화
+# =============================================================
+
+def _cleanup_stale_pending() -> int:
+    """48시간 이상 된 pending 날짜를 초기화 (변경 요청 → 거절된 경우)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT booking_id, guest_name, pending_checkin FROM reservations "
+            "WHERE pending_checkin IS NOT NULL "
+            "  AND created_at <= datetime('now', '-48 hours')"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    if not rows:
+        return 0
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE reservations SET pending_checkin = NULL, pending_checkout = NULL "
+            "WHERE pending_checkin IS NOT NULL "
+            "  AND created_at <= datetime('now', '-48 hours')"
+        )
+        conn.commit()
+
+    for r in rows:
+        logger.info("[Pending 초기화] %s: pending %s 만료", r["guest_name"], r["pending_checkin"])
+
+    return len(rows)
+
+
+# =============================================================
+# iCal 날짜 변경 감지
+# =============================================================
+
+def _detect_ical_date_changes() -> int:
+    """iCal의 날짜와 DB 날짜를 비교하여 변경 감지 및 업데이트."""
+    env = load_env()
+    url = env.get("AIRBNB_ICAL_URL", "")
+    if not url:
+        return 0
+
+    from modules.detector import _download_airbnb_ical, _parse_airbnb_ical, _to_date
+
+    ical_bytes = _download_airbnb_ical(url)
+    if not ical_bytes:
+        return 0
+
+    try:
+        ical_events = _parse_airbnb_ical(ical_bytes)
+    except Exception:
+        return 0
+    finally:
+        del ical_bytes
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT booking_id, guest_name, checkin, checkout, guests, "
+            "       google_event_id_a, google_event_id_b "
+            "FROM reservations "
+            "WHERE platform = 'airbnb' AND status = 'confirmed'"
+        )
+        db_rows = {r["booking_id"]: dict(r) for r in cur.fetchall()}
+
+    if not db_rows:
+        return 0
+
+    config = load_config()
+    owner_cal = config.get("naver_owner_calendar", "")
+    staff_cal = config.get("naver_staff_calendar", "")
+    updated = 0
+
+    for ev in ical_events:
+        bid = ev["booking_id"]
+        if bid not in db_rows:
+            continue
+
+        row = db_rows[bid]
+        ical_ci = ev.get("checkin")
+        ical_co = ev.get("checkout")
+        db_ci = _to_date(row["checkin"])
+        db_co = _to_date(row["checkout"])
+
+        if not ical_ci or not ical_co or not db_ci or not db_co:
+            continue
+        if ical_ci == db_ci and ical_co == db_co:
+            continue
+
+        # 날짜 변경 감지
+        nights = (ical_co - ical_ci).days
+        staff_name = config.get("staff_name", "")
+        guests_str = str(row["guests"] or 2)
+
+        calendar.update_event_dates(
+            row["google_event_id_a"], owner_cal, ical_ci, ical_co
+        )
+
+        if nights > 1:
+            summary_b = f"{staff_name} / 성인 {guests_str}명 (연박{nights}배)"
+        else:
+            summary_b = f"{staff_name} / 성인 {guests_str}명"
+        calendar.update_event_dates(
+            row["google_event_id_b"], staff_cal,
+            ical_ci, ical_ci + timedelta(days=1), summary_b
+        )
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE reservations SET checkin = ?, checkout = ?, "
+                "  pending_checkin = NULL, pending_checkout = NULL "
+                "WHERE booking_id = ?",
+                (ical_ci.isoformat(), ical_co.isoformat(), bid),
+            )
+            conn.commit()
+
+        guest_name = row["guest_name"] or "게스트"
+        notifier._send_kakao_message(
+            f"[예약 변경 확정] {guest_name}님\n"
+            f"📅 기존: {db_ci}~{db_co}\n"
+            f"📅 변경: {ical_ci}~{ical_co}\n"
+            "✅ 캘린더 업데이트 완료\n"
+            "⚠️ 네이버 플레이스 수동 차단 해제 필요"
+        )
+        logger.info("[iCal 변경] %s: %s~%s → %s~%s", guest_name, db_ci, db_co, ical_ci, ical_co)
+        updated += 1
+
+    return updated
+
+
+# =============================================================
 # 24시간 미해결 알림
 # =============================================================
 
 def _alert_stale_reservations() -> None:
-    """24시간 이상 이름/인원 미확인 예약이 있으면 카카오 알림."""
+    """24시간 이상 이름/인원 미확인 예약이 있으면 카카오 알림 (일회성)."""
     with get_connection() as conn:
         cur = conn.execute(
-            "SELECT booking_id, guest_name, checkin, created_at FROM reservations "
+            "SELECT booking_id, guest_name, checkin FROM reservations "
             "WHERE status = 'confirmed' "
             "  AND (guest_name IN ('?', '', '확인필요', '(예약됨)') OR google_event_id_a IS NULL) "
-            "  AND created_at <= datetime('now', '-24 hours')"
+            "  AND created_at <= datetime('now', '-24 hours') "
+            "  AND (unprocessed_alert_sent IS NULL OR unprocessed_alert_sent = 0)"
         )
         rows = [dict(r) for r in cur.fetchall()]
 
@@ -249,7 +511,16 @@ def _alert_stale_reservations() -> None:
     notifier._send_kakao_message(
         f"[미처리 예약 {len(rows)}건] 24시간 경과, 수동 확인 필요: {names}"
     )
-    logger.warning("[알림] 24시간 미처리 예약 %d건: %s", len(rows), names)
+
+    with get_connection() as conn:
+        for r in rows:
+            conn.execute(
+                "UPDATE reservations SET unprocessed_alert_sent = 1 WHERE booking_id = ?",
+                (r["booking_id"],),
+            )
+        conn.commit()
+
+    logger.warning("[알림] 24시간 미처리 예약 %d건 (알림 완료): %s", len(rows), names)
 
 
 # =============================================================
@@ -502,6 +773,13 @@ def run_pipeline() -> int:
         stat_update = 0
         logger.exception("예약 정보 업데이트 중 예외")
 
+    # 에어비앤비 예약 변경 처리
+    try:
+        stat_modify = _handle_airbnb_modifications()
+    except Exception:
+        stat_modify = 0
+        logger.exception("예약 변경 처리 중 예외")
+
     # 체크인 D-1 3행시 발송 (8~9시)
     try:
         stat_samhaengsi = _send_checkin_day_samhaengsi()
@@ -515,6 +793,19 @@ def run_pipeline() -> int:
     except Exception:
         stat_cleanup = 0
         logger.exception("캘린더 정리 중 예외")
+
+    # iCal 날짜 변경 감지 (호스트 직접 변경 등)
+    try:
+        stat_ical_change = _detect_ical_date_changes()
+    except Exception:
+        stat_ical_change = 0
+        logger.exception("iCal 날짜 변경 감지 중 예외")
+
+    # 48시간 pending 자동 초기화
+    try:
+        _cleanup_stale_pending()
+    except Exception:
+        logger.exception("pending 초기화 중 예외")
 
     # 24시간 미해결 예약 알림
     try:
@@ -536,8 +827,8 @@ def run_pipeline() -> int:
     gc.collect()
 
     logger.info(
-        "처리 요약 — 신규 %d건 / 취소 %d건 / 업데이트 %d건 / 3행시 %d건 / 정리 %d건 / 실패 %d건",
-        stat_new, stat_cancel, stat_update, stat_samhaengsi, stat_cleanup, stat_fail,
+        "처리 요약 — 신규 %d건 / 취소 %d건 / 변경 %d건 / 업데이트 %d건 / 3행시 %d건 / 정리 %d건 / 실패 %d건",
+        stat_new, stat_cancel, stat_modify, stat_update, stat_samhaengsi, stat_cleanup, stat_fail,
     )
     return 0 if stat_fail == 0 else 1
 

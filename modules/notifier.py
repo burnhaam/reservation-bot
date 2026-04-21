@@ -345,6 +345,17 @@ def _convert_english_to_korean(name: str) -> Optional[str]:
         return None
 
 
+def _normalize_name_for_samhaengsi(name: str) -> str:
+    """3행시용 이름 정규화. '이름 성' → '성이름' (띄어쓰기 없이)."""
+    import re
+    parts = name.split()
+    if len(parts) == 2 and all(re.match(r'^[가-힣]+$', p) for p in parts):
+        given, family = parts
+        if len(family) == 1 and len(given) >= 1:
+            return f"{family}{given}"
+    return name
+
+
 def send_samhaengsi(name: str) -> None:
     """이름으로 3행시를 생성하고 카카오톡으로 전송."""
     original_name = name
@@ -357,6 +368,8 @@ def send_samhaengsi(name: str) -> None:
             logger.info("[3행시] 영문→한국어 변환: %s → %s", name, korean_name)
         else:
             logger.warning("[3행시] 영문→한국어 변환 실패, 원본 사용: %s", name)
+    else:
+        korean_name = _normalize_name_for_samhaengsi(name)
 
     poem = _generate_samhaengsi(korean_name)
     if not poem:
