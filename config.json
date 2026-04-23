@@ -9,5 +9,23 @@
   },
   "blocked_ical_path": "ical/blocked.ics",
   "naver_block_method": "api",
-  "base_guests": 2
+  "base_guests": 2,
+  "stock": {
+    "enabled": true,
+    "calendar_name": "소캠스 예약일정",
+    "duplicate_window_days": 3,
+    "max_daily_orders": 100,
+    "price_threshold_multiplier": 1.5,
+    "gemini_model": "gemini-2.5-flash",
+    "memo_lookback_days": 7,
+    "playwright": {
+      "headless": false,
+      "delay_min_sec": 2,
+      "delay_max_sec": 5,
+      "between_items_min_sec": 5,
+      "between_items_max_sec": 10,
+      "retry_count": 3,
+      "browser_timeout_sec": 30
+    }
+  }
 }

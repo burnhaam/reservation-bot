@@ -17,7 +17,7 @@ schedule>=1.2.1
 # 웹훅 수신 서버
 flask>=3.0.0
 
-# Gemini API (3행시 생성)
+# Gemini API (3행시 생성 + 재고 메모 파싱)
 google-genai>=1.0.0
 
 # 프로세스 감시 (워치독)
@@ -27,3 +27,15 @@ psutil>=5.9.0
 google-api-python-client>=2.120.0
 google-auth>=2.28.0
 google-auth-oauthlib>=1.2.0
+
+# 쿠팡 장바구니 자동화 (재고 자동주문)
+playwright>=1.45.0
+playwright-stealth>=2.0.0
+# patchright: Playwright fork로 Chromium 자동화 시그니처를 패치하여 Akamai 봇 탐지 우회
+patchright>=1.0.0
+# browser_cookie3: 실제 Chrome의 DPAPI/AES-GCM 암호화 쿠키를 복호화해
+# storage_state로 변환 (Akamai 봇 챌린지 우회용 — 로그인 자동화 회피 경로)
+browser_cookie3>=0.19.1
+
+# Discord 봇 (카카오 알림 이중화 + 슬래시 커맨드 기반 승인)
+discord.py>=2.3.0

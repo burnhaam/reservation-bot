@@ -20,6 +20,24 @@ logs/
 # iCal (예약 날짜 정보)
 ical/blocked.ics
 
+# 쿠팡 세션 (로그인 쿠키 + 쿠키 원본 export)
+data/coupang_session.json
+data/coupang_cookies_export.json
+data/*.local.json
+
+# 알림 디듀프 / 런타임 상태 (로컬 전용)
+data/notify_state.json
+data/parser_failure_state.json
+data/pending_approvals.json
+data/samhaengsi_sent_events.json
+data/last_success.txt
+data/.pipeline.lock
+data/.vacuum_*
+
+# 주문내역 분석 엑셀 (개인 주문 정보 포함 가능)
+주문내역_분석_매핑표.xlsx
+*_매핑표.xlsx
+
 # Python 캐시
 __pycache__/
 *.pyc

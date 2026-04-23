@@ -8,9 +8,11 @@
 호출 실패는 예외로 던지지 않고 로그만 남긴다.
 """
 
+import hashlib
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -30,12 +32,98 @@ logger = logging.getLogger(__name__)
 _KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 _KAKAO_MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 
+# 알림 중복/쿨다운 상태 저장 파일. 키 → 마지막 발송 ISO 시각.
+_NOTIFY_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "notify_state.json"
+
+
+# =============================================================
+# Discord 웹훅 (이중화 알림)
+# =============================================================
+
+def _send_discord_webhook(text: str) -> bool:
+    """Discord 채널에 웹훅으로 메시지 발송. 실패해도 예외 미전파.
+
+    DISCORD_WEBHOOK_URL 미설정이면 조용히 스킵.
+    카카오와 병행 호출되므로 한쪽 실패가 다른 쪽에 영향 주면 안 됨.
+    """
+    env = load_env()
+    webhook_url = env.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return False
+    # Discord 메시지 제한: 2000자. 초과 시 잘라냄.
+    payload = {"content": text[:1950] + ("…" if len(text) > 1950 else "")}
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=10)
+        if r.status_code in (200, 204):
+            return True
+        logger.warning("[Discord] 웹훅 응답 %s: %s", r.status_code, r.text[:200])
+        return False
+    except requests.RequestException as e:
+        logger.warning("[Discord] 웹훅 전송 실패: %s", e)
+        return False
+    except Exception:
+        logger.exception("[Discord] 웹훅 예기치 못한 오류")
+        return False
+
 
 # 플랫폼 코드 → 알림 메시지 표기용 한글 이름
 _PLATFORM_DISPLAY = {
     "airbnb": "에어비앤비",
     "naver": "네이버",
 }
+
+
+# =============================================================
+# 알림 디듀프/쿨다운
+# =============================================================
+
+def _load_notify_state() -> dict:
+    try:
+        if _NOTIFY_STATE_PATH.exists():
+            return json.loads(_NOTIFY_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("[Notify] 상태 파일 로드 실패: %s", _NOTIFY_STATE_PATH)
+    return {}
+
+
+def _save_notify_state(state: dict) -> None:
+    try:
+        _NOTIFY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _NOTIFY_STATE_PATH.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("[Notify] 상태 파일 저장 실패: %s", _NOTIFY_STATE_PATH)
+
+
+def _should_send(dedup_key: str, cooldown_hours: Optional[float]) -> bool:
+    """dedup_key 기반으로 이번 발송을 허용할지 판단.
+
+    cooldown_hours=None → 키당 영구 1회 (이미 보낸 적 있으면 False).
+    cooldown_hours=N    → N시간 이내 같은 키는 False.
+    """
+    if not dedup_key:
+        return True
+    state = _load_notify_state()
+    last = state.get(dedup_key)
+    if not last:
+        return True
+    if cooldown_hours is None:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    return datetime.now() - last_dt >= timedelta(hours=cooldown_hours)
+
+
+def _mark_sent(dedup_key: str) -> None:
+    if not dedup_key:
+        return
+    state = _load_notify_state()
+    state[dedup_key] = datetime.now().isoformat()
+    _save_notify_state(state)
 
 
 # =============================================================
@@ -177,10 +265,24 @@ def _post_memo(access_token: str, text: str) -> bool:
 
 
 def send_notification(reservation: dict, action: str) -> None:
-    """예약/취소 알림을 카카오톡 나에게 보내기로 전송."""
+    """예약/취소 알림을 카카오톡 + 디스코드에 동시 전송.
+
+    동일 (platform, booking_id, action) 조합은 영구 1회만 발송.
+    """
     message = _build_message(reservation, action)
     if not message:
         return
+
+    booking_id = reservation.get("booking_id", "")
+    platform = reservation.get("platform", "")
+    dedup_key = f"reservation:{platform}:{booking_id}:{action}" if booking_id else ""
+
+    if dedup_key and not _should_send(dedup_key, None):
+        logger.info("[Notify] 중복 차단 — 이미 발송 (dedup_key=%s)", dedup_key)
+        return
+
+    # Discord 병행 발송 (실패 무관)
+    _send_discord_webhook(message)
 
     env = load_env()
     access_token = env.get("KAKAO_ACCESS_TOKEN", "")
@@ -188,17 +290,23 @@ def send_notification(reservation: dict, action: str) -> None:
     # 1) 기존 액세스 토큰으로 전송 시도
     if access_token and _post_memo(access_token, message):
         logger.info("[Kakao] 알림 전송 OK (action=%s)", action)
+        if dedup_key:
+            _mark_sent(dedup_key)
         return
 
     # 2) 실패 또는 토큰 없음 → 리프레시 후 재시도
     access_token = _refresh_kakao_access_token()
     if not access_token:
+        if dedup_key:
+            _mark_sent(dedup_key)  # Discord는 보냈을 수 있으니 중복 방지
         return
 
     if _post_memo(access_token, message):
         logger.info("[Kakao] 알림 전송 OK (토큰 갱신 후, action=%s)", action)
     else:
         logger.error("[Kakao] 토큰 갱신 후에도 전송 실패 (action=%s)", action)
+    if dedup_key:
+        _mark_sent(dedup_key)
 
 
 def send_guests_update(guest_name: str, old_guests: int, new_guests: int) -> None:
@@ -288,19 +396,36 @@ def _generate_samhaengsi(name: str) -> Optional[str]:
     return retry or result
 
 
-def _send_kakao_message(text: str) -> bool:
-    """카카오톡 나에게 보내기로 텍스트 전송. 토큰 만료 시 자동 갱신."""
+def _send_kakao_message(text: str,
+                        dedup_key: Optional[str] = None,
+                        cooldown_hours: Optional[float] = None) -> bool:
+    """카카오톡 나에게 보내기로 텍스트 전송. 토큰 만료 시 자동 갱신.
+    Discord 웹훅으로도 동시 발송 (이중화).
+
+    dedup_key 지정 시 _should_send/_mark_sent로 중복 발송 차단.
+    cooldown_hours=None 이면 영구 1회 (이미 보낸 키는 다시 안 보냄).
+    """
+    if dedup_key and not _should_send(dedup_key, cooldown_hours):
+        logger.info("[Notify] 중복 차단 (dedup_key=%s)", dedup_key)
+        return False
+
+    # Discord는 카카오 성패와 무관하게 항상 시도 (이중화)
+    _send_discord_webhook(text)
+
     env = load_env()
     access_token = env.get("KAKAO_ACCESS_TOKEN", "")
 
+    kakao_ok = False
     if access_token and _post_memo(access_token, text):
-        return True
+        kakao_ok = True
+    else:
+        access_token = _refresh_kakao_access_token()
+        if access_token and _post_memo(access_token, text):
+            kakao_ok = True
 
-    access_token = _refresh_kakao_access_token()
-    if access_token and _post_memo(access_token, text):
-        return True
-
-    return False
+    if dedup_key:
+        _mark_sent(dedup_key)  # 카카오/디스코드 중 하나라도 시도했으면 dedup 기록
+    return kakao_ok
 
 
 def _is_english_name(name: str) -> bool:
@@ -354,6 +479,130 @@ def _normalize_name_for_samhaengsi(name: str) -> str:
         if len(family) == 1 and len(given) >= 1:
             return f"{family}{given}"
     return name
+
+
+# =============================================================
+# 재고 자동주문 알림
+# =============================================================
+
+def _format_price(price) -> str:
+    """원 단위 가격을 '12,800원' 형식으로 포맷팅."""
+    if price is None:
+        return "가격 미확인"
+    try:
+        return f"{int(price):,}원"
+    except (TypeError, ValueError):
+        return str(price)
+
+
+def _build_stock_message(result: dict) -> Optional[str]:
+    """재고 자동주문 처리 결과를 카카오톡용 메시지 문자열로 변환.
+
+    입력: {"success": [...], "skipped": [...], "unmapped": [...], "failed": [...]}
+    처리 항목이 하나도 없으면 None 반환 → 알림 생략.
+    """
+    success = result.get("success") or []
+    skipped = result.get("skipped") or []
+    unmapped = result.get("unmapped") or []
+    failed = result.get("failed") or []
+
+    if not (success or skipped or unmapped or failed):
+        return None
+
+    lines: list[str] = ["[재고 자동주문 완료]"]
+
+    if success:
+        lines.append("")
+        lines.append(f"✅ 장바구니에 담음 ({len(success)}건):")
+        for i, item in enumerate(success, 1):
+            name = item.get("item_name", "?")
+            qty = item.get("quantity", 1)
+            price = _format_price(item.get("price"))
+            lines.append(f"{i}. {name} ({qty}개) - {price}")
+
+    if skipped:
+        lines.append("")
+        lines.append(f"⏭️ 자동 스킵 ({len(skipped)}건):")
+        for item in skipped:
+            name = item.get("item_name", "?")
+            reason = item.get("reason", "사유 불명")
+            lines.append(f"- {name}: {reason}")
+
+    if unmapped:
+        lines.append("")
+        lines.append(f"⚠️ 매핑 필요 ({len(unmapped)}건):")
+        for item in unmapped:
+            name = item.get("item_name", "?")
+            lines.append(f"- {name}: 매핑표에 없음")
+
+    if failed:
+        lines.append("")
+        lines.append(f"❌ 처리 실패 ({len(failed)}건):")
+        for item in failed:
+            name = item.get("item_name", "?")
+            reason = item.get("reason", "사유 불명")
+            lines.append(f"- {name}: {reason}")
+
+    # 총액 (성공 건 합계)
+    try:
+        total = sum(int(s.get("price") or 0) for s in success)
+        if total > 0:
+            lines.append("")
+            lines.append(f"총 {total:,}원")
+            lines.append("👉 쿠팡 앱에서 결제해주세요.")
+    except (TypeError, ValueError):
+        pass
+
+    return "\n".join(lines)
+
+
+def send_stock_result(result: dict) -> None:
+    """재고 자동주문 처리 결과를 카카오톡으로 전송.
+
+    처리 항목이 0건이면 발송하지 않는다. 동일 내용 메시지는 notify_state 기반으로
+    영구 디듀프되어 재발송되지 않는다.
+    """
+    message = _build_stock_message(result)
+    if not message:
+        logger.info("[Stock] 처리 항목 0건 — 알림 생략")
+        return
+
+    msg_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+    dedup_key = f"stock_result:{msg_hash}"
+
+    if not _should_send(dedup_key, None):
+        logger.info("[Stock] 결과 알림 스킵 (동일 내용 이미 발송됨)")
+        return
+
+    if _send_kakao_message(message):
+        logger.info("[Stock] 결과 알림 전송 OK")
+        _mark_sent(dedup_key)
+    else:
+        logger.error("[Stock] 결과 알림 전송 실패")
+
+
+def send_stock_alert(message: str,
+                     dedup_key: Optional[str] = None,
+                     cooldown_hours: Optional[float] = None) -> None:
+    """SMS/세션 만료/크래시 등 즉시 알림용.
+
+    dedup_key가 주어지면 notify_state 기반 중복/쿨다운 체크 후 발송한다.
+    cooldown_hours=None → 키당 영구 1회, cooldown_hours=N → N시간 이내 같은 키 스킵.
+    """
+    if not message:
+        return
+
+    if dedup_key and not _should_send(dedup_key, cooldown_hours):
+        logger.info("[Stock] 알림 스킵 (key=%s, cooldown=%sh)",
+                    dedup_key, cooldown_hours)
+        return
+
+    if _send_kakao_message(message):
+        logger.info("[Stock] 긴급 알림 전송 OK")
+        if dedup_key:
+            _mark_sent(dedup_key)
+    else:
+        logger.error("[Stock] 긴급 알림 전송 실패")
 
 
 def send_samhaengsi(name: str) -> None:

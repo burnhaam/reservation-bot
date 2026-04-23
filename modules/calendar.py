@@ -10,7 +10,7 @@ D-7 정오, D-1 정오 팝업 알림이 설정된다.
 
 import logging
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -284,3 +284,114 @@ def delete_events(
         _delete_google_event(gsvc, config.get("naver_owner_calendar", ""), google_event_id_a)
     if google_event_id_b:
         _delete_google_event(gsvc, config.get("naver_staff_calendar", ""), google_event_id_b)
+
+
+# =============================================================
+# 특정 날짜 이벤트 조회
+# =============================================================
+
+def list_events_on_date(calendar_name: str, target_date: date) -> list[dict]:
+    """지정 캘린더에서 target_date에 시작하는 일정 목록을 반환.
+
+    반환 각 항목: {"event_id", "summary", "start_date"}.
+    실패 시 빈 리스트.
+    """
+    import socket
+    socket.setdefaulttimeout(30)
+
+    try:
+        gsvc = _get_google_calendar_service()
+    except Exception:
+        logger.exception("[Calendar] 서비스 초기화 실패")
+        return []
+
+    cal_id = _resolve_google_calendar_id(gsvc, calendar_name)
+    if not cal_id:
+        return []
+
+    next_day = target_date + timedelta(days=1)
+    try:
+        resp = gsvc.events().list(
+            calendarId=cal_id,
+            timeMin=target_date.isoformat() + "T00:00:00+09:00",
+            timeMax=next_day.isoformat() + "T00:00:00+09:00",
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        ).execute()
+    except Exception:
+        logger.exception("[Calendar] 이벤트 조회 실패 (calendar=%s, date=%s)",
+                         calendar_name, target_date)
+        return []
+
+    result = []
+    for ev in resp.get("items", []):
+        start = ev.get("start", {})
+        result.append({
+            "event_id": ev.get("id", ""),
+            "summary": ev.get("summary", "") or "",
+            "start_date": start.get("date") or start.get("dateTime", ""),
+        })
+    return result
+
+
+# =============================================================
+# 재고 메모 조회 (stock 자동주문)
+# =============================================================
+
+def read_stock_memos(calendar_name: str, lookback_days: int) -> list[dict]:
+    """지정 캘린더의 최근 N일 + 향후 1일 일정 중 description이 있는 것만 반환.
+
+    기존 _get_google_calendar_service()를 재활용하여 구글 캘린더에서 일정을 조회한다.
+    반환 각 항목: {"event_id", "summary", "description", "start_date"}
+    description이 빈 문자열이거나 None인 일정은 제외한다.
+    """
+    # 안정성: Google API 호출이 소켓 레벨에서 영원히 매달리지 않도록 30초 한도 지정.
+    # 프로세스 전역 기본값을 변경하므로 최초 1회만 설정되면 이후 호출에도 적용된다.
+    import socket
+    socket.setdefaulttimeout(30)
+
+    try:
+        gsvc = _get_google_calendar_service()
+    except Exception:
+        logger.exception("[Stock] 구글 캘린더 서비스 초기화 실패")
+        return []
+
+    cal_id = _resolve_google_calendar_id(gsvc, calendar_name)
+    if not cal_id:
+        logger.error("[Stock] 캘린더를 찾을 수 없음: %s", calendar_name)
+        return []
+
+    now = datetime.now(timezone.utc)
+    time_min = (now - timedelta(days=lookback_days)).isoformat()
+    time_max = (now + timedelta(days=1)).isoformat()
+
+    try:
+        resp = gsvc.events().list(
+            calendarId=cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=2500,
+        ).execute()
+    except Exception:
+        logger.exception("[Stock] 캘린더 이벤트 조회 실패: %s", calendar_name)
+        return []
+
+    memos: list[dict] = []
+    for ev in resp.get("items", []):
+        desc = (ev.get("description") or "").strip()
+        if not desc:
+            continue
+        start = ev.get("start", {})
+        start_date = start.get("date") or start.get("dateTime") or ""
+        memos.append({
+            "event_id": ev.get("id", ""),
+            "summary": ev.get("summary", ""),
+            "description": desc,
+            "start_date": start_date,
+        })
+
+    logger.info("[Stock] 메모 조회 완료: %d건 (캘린더=%s)", len(memos), calendar_name)
+    return memos

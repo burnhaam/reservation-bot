@@ -12,7 +12,7 @@ webhook_server.py(5000), serve_ical.py(8080)가 응답하는지 확인하고
 import logging
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
@@ -90,6 +90,36 @@ def _send_kakao_alert(message: str) -> None:
         _send_kakao_message(message)
     except Exception as e:
         logger.error("[Watchdog] 카카오 알림 실패: %s", e)
+
+
+# =============================================================
+# 파이프라인 헬스체크 (main.py --check 및 watchdog.py에서 공용)
+# =============================================================
+
+def check_pipeline_health(max_age_hours: int = 3) -> tuple[bool, str]:
+    """data/last_success.txt의 최근 성공 기록으로 파이프라인 건강도 판단.
+
+    main.run_pipeline() 정상 완료 시 이 파일이 갱신된다. cron/Task Scheduler에서
+    1시간마다 실행되므로, 3시간 이상 갱신이 없으면 파이프라인이 멈춘 것으로 간주.
+
+    Returns:
+        (healthy: bool, message: str) — 메시지는 콘솔/알림에 그대로 사용 가능.
+    """
+    flag_path = PROJECT_ROOT / "data" / "last_success.txt"
+    if not flag_path.exists():
+        return False, "파이프라인이 아직 1회도 성공하지 못함"
+    try:
+        last_time = datetime.fromisoformat(
+            flag_path.read_text(encoding="utf-8").strip()
+        )
+    except Exception as e:
+        return False, f"last_success.txt 파싱 실패: {e}"
+    age = datetime.now() - last_time
+    if age.total_seconds() > max_age_hours * 3600:
+        return False, (
+            f"마지막 성공 {age.total_seconds()/3600:.1f}시간 전 — 점검 필요"
+        )
+    return True, f"정상 (마지막 성공 {age.total_seconds()/60:.0f}분 전)"
 
 
 _FAIL_COUNT_FILE = LOG_DIR / "watchdog_fails.json"
