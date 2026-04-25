@@ -25,6 +25,7 @@ ENV_KEYS = [
     "NAVER_PLACE_ID",
     "GITHUB_TOKEN",
     "GEMINI_API_KEY",
+    "GEMINI_API_KEY_BACKUP",
     # Discord 알림/봇
     "DISCORD_WEBHOOK_URL",
     "DISCORD_BOT_TOKEN",

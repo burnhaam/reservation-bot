@@ -49,7 +49,11 @@
       "Bash(PYTHONIOENCODING=utf-8 python scripts/coupang_test_order_match.py)",
       "Bash(tasklist //FI \"IMAGENAME eq python.exe\")",
       "Bash(taskkill //F //PID 19932)",
-      "Bash(PYTHONIOENCODING=utf-8 python scripts/_test_discord_approvals.py)"
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/_test_discord_approvals.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/coupang_recon_order_group.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/_test_order_groups.py)",
+      "PowerShell(Stop-ScheduledTask *)",
+      "Bash(awk 'NR==17' .env)"
     ]
   }
 }

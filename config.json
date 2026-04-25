@@ -10,6 +10,10 @@
   "blocked_ical_path": "ical/blocked.ics",
   "naver_block_method": "api",
   "base_guests": 2,
+  "notifications": {
+    "kakao_enabled": false,
+    "discord_enabled": true
+  },
   "stock": {
     "enabled": true,
     "calendar_name": "소캠스 예약일정",

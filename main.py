@@ -955,6 +955,12 @@ def run_pipeline() -> int:
         except Exception:
             logger.exception("재고 자동주문 파이프라인 중 예외")
 
+        # 로직 ①③ — 매일 07시 1회, 3일+ 경과 미확정 건 있을 때만 실행
+        try:
+            _run_order_confirmation_scan_if_due()
+        except Exception:
+            logger.exception("주문 확인 스캔 중 예외")
+
     except Exception:
         # 내부 블록 어디서도 처리 못 한 예외 — 프로세스는 살리고 다음 사이클로 넘김
         logger.exception("[파이프라인] 예기치 못한 전역 예외 (흡수됨, 다음 사이클로 계속)")
@@ -1219,7 +1225,9 @@ def run_stock_pipeline() -> int:
             # 미매핑이어도 여기서 unmapped로 확정하지 않고 to_order에 url=""로 넘김.
             # add_items_to_cart가 브라우저 오픈 후 match_from_order_history (2순위)로
             # 주문내역 검색을 시도하고, 그래도 없으면 그때 unmapped로 분류한다.
-            hit = product_matcher.match_from_mapping(canonical_name, mapping)
+            # raw_name 전달: variant 선별용 (예: "곰곰 쌀과자 달콤한맛" 메모 →
+            # canonical "곰곰 쌀과자" 의 variants 중 "달콤한맛" variant 만 선택)
+            hit = product_matcher.match_from_mapping(canonical_name, mapping, raw_name=raw_name)
 
             # 현재 재고 + 최대재고 정의 시 부족분만큼 주문 (예: 장작 max=6, 현재 2 → 4개).
             # current_stock=None 또는 max_stock=0 이면 기존처럼 기본수량 사용.
@@ -1239,15 +1247,31 @@ def run_stock_pipeline() -> int:
                     continue
                 quantity = needed
 
-            to_order.append({
-                "item_name": canonical_name,
-                # hit이 없으면 url=""로 넘김 → add_items_to_cart가 주문내역 검색 시도
-                "url": (hit or {}).get("url", ""),
-                "quantity": quantity,
-                "max_price": (hit or {}).get("max_price", 0),
-                "source": (hit or {}).get("source", "mapping") if hit else "need_search",
-                "_db_base": base_row,
-            })
+            # variants 배열이 있으면 여러 URL 모두 장바구니에 담기
+            # (예: "곰곰 쌀과자" canonical 하나에 고소한맛/달콤한맛 2 variants)
+            variants = (hit or {}).get("variants") or []
+            if variants:
+                for v in variants:
+                    v_qty = int(v.get("quantity", quantity) or quantity)
+                    to_order.append({
+                        "item_name": canonical_name,
+                        "url": v.get("url", ""),
+                        "quantity": v_qty,
+                        "max_price": (hit or {}).get("max_price", 0),
+                        "source": (hit or {}).get("source", "mapping"),
+                        "_db_base": base_row,
+                        "_variant_name": v.get("name", ""),
+                    })
+            else:
+                to_order.append({
+                    "item_name": canonical_name,
+                    # hit이 없으면 url=""로 넘김 → add_items_to_cart가 주문내역 검색 시도
+                    "url": (hit or {}).get("url", ""),
+                    "quantity": quantity,
+                    "max_price": (hit or {}).get("max_price", 0),
+                    "source": (hit or {}).get("source", "mapping") if hit else "need_search",
+                    "_db_base": base_row,
+                })
 
     # 3) Playwright 장바구니 담기
     order_result = {"success": [], "skipped": [], "failed": [], "stopped": False, "stop_reason": ""}
@@ -1261,19 +1285,35 @@ def run_stock_pipeline() -> int:
             logger.exception("[Stock] 쿠팡 장바구니 처리 중 예외")
 
     # 4) 결과 DB 기록
+    # variants 다중 URL 대응: (item_name, url) 복합키. 동일 이름 variant 별 구분.
+    def _rkey(s: dict) -> tuple:
+        return (s.get("item_name", ""), (s.get("url") or s.get("matched_url") or "").split("?")[0])
+
+    result_by_key: dict[tuple, tuple[str, dict]] = {
+        _rkey(s): ("success", s) for s in order_result.get("success", [])
+    }
+    for s in order_result.get("skipped", []):
+        result_by_key[_rkey(s)] = ("skipped", s)
+    for s in order_result.get("failed", []):
+        result_by_key[_rkey(s)] = ("failed", s)
+    for s in order_result.get("unmapped", []):
+        result_by_key[_rkey(s)] = ("unmapped", s)
+
+    # 이름만으로 lookup 도 남겨둠 (coupang_orderer 가 url 미반환 시 폴백)
     result_by_name = {s["item_name"]: ("success", s) for s in order_result.get("success", [])}
     for s in order_result.get("skipped", []):
         result_by_name[s["item_name"]] = ("skipped", s)
     for s in order_result.get("failed", []):
         result_by_name[s["item_name"]] = ("failed", s)
-    # 주문내역 fallback도 실패한 진짜 unmapped
     for s in order_result.get("unmapped", []):
         result_by_name[s["item_name"]] = ("unmapped", s)
 
     for item in to_order:
         name = item["item_name"]
         base_row = item["_db_base"]
-        outcome = result_by_name.get(name)
+        # url 포함 복합키로 먼저 조회, 없으면 이름만으로 폴백
+        item_url_base = (item.get("url") or "").split("?")[0]
+        outcome = result_by_key.get((name, item_url_base)) or result_by_name.get(name)
         if not outcome:
             # 파이프라인 중단 등으로 처리 안 된 경우 → 실패로 기록
             _record_stock_order({**base_row,
@@ -1356,7 +1396,109 @@ def run_stock_pipeline() -> int:
         len(notify_payload["failed"]),
         len(deferred_rows),
     )
+
+    # 로직 ② — 이번 사이클에서 실제로 뭔가 처리했으면 주문내역 기반 매핑 학습 실행.
+    # 사용자가 메모 받고 수동 주문까지 한 상태라면 이 시점에 새 상품 자동 매핑됨.
+    # 아직 결제 전이면 묶음 매치 없어서 아무것도 안 함 (0 비용).
+    if any([notify_payload["success"], notify_payload["skipped"],
+            notify_payload["unmapped"], notify_payload["failed"]]):
+        try:
+            from modules.coupang_orderer import (
+                init_browser, close_browser, is_session_valid, _is_cdp_available,
+            )
+            from modules.product_matcher import sync_mapping_from_orders
+            if _is_cdp_available():
+                p, browser, ctx, page = init_browser()
+                try:
+                    if is_session_valid(page):
+                        sync_mapping_from_orders(page, mode="instant", lookback_days=14)
+                    else:
+                        logger.warning("[Stock] 세션 무효 — 매핑 학습 스킵")
+                finally:
+                    close_browser(p, browser, ctx, page)
+            else:
+                logger.info("[Stock] CDP 미가용 — 매핑 학습 스킵")
+        except Exception:
+            logger.exception("[Stock] 매핑 자동 학습 중 예외 (파이프라인에 영향 없음)")
+
     return len(candidates)
+
+
+def _run_order_confirmation_scan_if_due() -> None:
+    """매일 07시대 1회, 3일+ 경과 미확정(scan_done_at NULL) stock_orders 가 있으면
+    주문내역 스캔 + 로직 ①③ 실행.
+
+    Akamai 리스크 최소화 설계:
+    - 발동 시각: 07:00~07:59 (쿠팡 저트래픽 시간대)
+    - 대상: status='ordered' AND scan_done_at IS NULL AND detected_at <= now-3일
+    - 스캔 후 대상 레코드 모두 scan_done_at 세팅 → 다시는 스캔 안 함
+    - 조건 미충족 시 브라우저조차 열지 않음
+
+    data/scan_state.json 의 last_run 날짜로 같은 날 1회만 실행.
+    """
+    now = datetime.now()
+    if now.hour != 7:
+        return
+
+    # 사전 체크: 대상 레코드 있는지 확인 (브라우저 열기 전)
+    try:
+        from modules.product_matcher import _stock_orders_pending_scan
+        pending = _stock_orders_pending_scan(min_age_days=3)
+    except Exception:
+        logger.exception("[Scan] 미확정 레코드 조회 실패")
+        return
+    if not pending:
+        return  # 조용히 종료 (매일 07시 호출되므로 로그 남기지 않음)
+
+    state_path = PROJECT_ROOT / "data" / "scan_state.json"
+    today_str = now.strftime("%Y-%m-%d")
+    try:
+        if state_path.exists():
+            import json as _json
+            last = _json.loads(state_path.read_text(encoding="utf-8")).get("last_run", "")
+            if last == today_str:
+                logger.info("[Scan] 오늘 이미 실행됨 — 스킵")
+                return
+    except Exception:
+        logger.warning("[Scan] 상태 파일 로드 실패 (강행)", exc_info=True)
+
+    logger.info("[Scan] 주문 확인 스캔 시작 — 대상 %d건", len(pending))
+    try:
+        from modules.coupang_orderer import (
+            init_browser, close_browser, is_session_valid, _is_cdp_available,
+        )
+        from modules.product_matcher import sync_mapping_from_orders
+        if not _is_cdp_available():
+            logger.warning("[Scan] CDP 미가용 — 스캔 스킵")
+            return
+        p, browser, ctx, page = init_browser()
+        try:
+            if not is_session_valid(page):
+                logger.warning("[Scan] 세션 무효 — 스캔 스킵")
+                return
+            result = sync_mapping_from_orders(page, mode="scheduled", lookback_days=14)
+            logger.info(
+                "[Scan] 결과: confirmed=%d unconfirmed=%d added=%d pending=%d",
+                len(result.get("confirmed", [])),
+                len(result.get("unconfirmed", [])),
+                len(result.get("added", [])),
+                len(result.get("pending", [])),
+            )
+        finally:
+            close_browser(p, browser, ctx, page)
+
+        # 멱등 플래그 저장 (브라우저 정상 종료 후)
+        try:
+            import json as _json
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                _json.dumps({"last_run": today_str}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("[Scan] 상태 파일 저장 실패", exc_info=True)
+    except Exception:
+        logger.exception("[Scan] 주문 확인 스캔 중 예외")
 
 
 def _record_last_success() -> None:

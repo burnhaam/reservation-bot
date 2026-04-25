@@ -215,7 +215,7 @@ def parse_shortage_items(memo_text: str) -> list[dict]:
         return []
 
     try:
-        client = genai.Client(api_key=api_key)
+        from modules.gemini_client import generate_content_with_fallback
         model = _get_model_name()
 
         hint = _build_canonical_hint()
@@ -224,7 +224,7 @@ def parse_shortage_items(memo_text: str) -> list[dict]:
         # response_schema로 JSON 배열 출력 강제. Gemini가 다른 텍스트 섞지 않음.
         # thinking_budget=0 — 2.5 Flash는 thinking 모델이라 기본값이면 추론에 토큰을
         # 먼저 써버려 빈 text가 나올 수 있음. 결정론적 추출 작업이므로 비활성화.
-        response = client.models.generate_content(
+        response = generate_content_with_fallback(
             model=model,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -373,13 +373,13 @@ def parse_shortage_items_batch(memos: list[dict]) -> dict:
     combined = "\n\n---\n\n".join(parts)
 
     try:
-        client = genai.Client(api_key=api_key)
+        from modules.gemini_client import generate_content_with_fallback
         model = _get_model_name()
 
         hint = _build_canonical_hint()
         contents = f"{hint}\n\n{combined}" if hint else combined
 
-        response = client.models.generate_content(
+        response = generate_content_with_fallback(
             model=model,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -470,11 +470,11 @@ def check_api_key_valid() -> tuple[bool, str]:
         return False, "GEMINI_API_KEY 환경변수 미설정"
 
     try:
-        client = genai.Client(api_key=api_key)
+        from modules.gemini_client import generate_content_with_fallback
         model = _get_model_name()
         # thinking_budget=0: 2.5 Flash는 thinking 모델이라 기본값이면 소량 토큰을
         # 전부 추론에 써버려 빈 응답이 됨. 점검용 호출에서는 비활성화.
-        response = client.models.generate_content(
+        response = generate_content_with_fallback(
             model=model,
             contents="ping",
             config=types.GenerateContentConfig(

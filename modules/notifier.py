@@ -330,18 +330,19 @@ def _is_valid_samhaengsi(text: str, name: str) -> bool:
     return starts >= 5
 
 
-def _call_gemini(client, prompt: str) -> Optional[str]:
-    """Gemini API 단일 호출."""
+def _call_gemini(prompt: str) -> Optional[str]:
+    """Gemini API 단일 호출. 429 시 백업 키로 자동 전환."""
     try:
-        response = client.models.generate_content(
+        from modules.gemini_client import generate_content_with_fallback
+        response = generate_content_with_fallback(
             model="gemini-2.5-flash",
+            contents=prompt,
             config={
                 "system_instruction": "당신은 재치있고 감동적인 3행시 작가입니다.",
                 "max_output_tokens": 1500,
                 "temperature": 0.9,
                 "thinking_config": {"thinking_budget": 0},
             },
-            contents=prompt,
         )
         return response.text.strip() if response.text else None
     except Exception as e:
@@ -381,14 +382,12 @@ def _generate_samhaengsi(name: str) -> Optional[str]:
         f'이제 "{name}" 3행시 5개를 지어줘:'
     )
 
-    client = genai.Client(api_key=api_key)
-
-    result = _call_gemini(client, prompt)
+    result = _call_gemini(prompt)
     if result and _is_valid_samhaengsi(result, name):
         return result
 
     logger.warning("[3행시] 불완전한 응답, 재시도: %s", result[:50] if result else "None")
-    retry = _call_gemini(client, prompt)
+    retry = _call_gemini(prompt)
     if retry and _is_valid_samhaengsi(retry, name):
         return retry
 
@@ -396,11 +395,28 @@ def _generate_samhaengsi(name: str) -> Optional[str]:
     return retry or result
 
 
+def _kakao_enabled() -> bool:
+    """config.json의 notifications.kakao_enabled 플래그 조회.
+
+    기본값 True (후방 호환). 설정파일 읽기 실패/키 없음도 True 반환.
+    """
+    try:
+        from modules.config_loader import load_config
+        cfg = load_config() or {}
+        notif = cfg.get("notifications") or {}
+        val = notif.get("kakao_enabled", True)
+        return bool(val)
+    except Exception:
+        return True
+
+
 def _send_kakao_message(text: str,
                         dedup_key: Optional[str] = None,
                         cooldown_hours: Optional[float] = None) -> bool:
-    """카카오톡 나에게 보내기로 텍스트 전송. 토큰 만료 시 자동 갱신.
-    Discord 웹훅으로도 동시 발송 (이중화).
+    """카카오톡 + Discord 병행 발송. 토큰 만료 시 자동 갱신.
+
+    config.notifications.kakao_enabled=false 면 카카오는 건너뜀 (Discord는 계속).
+    토큰 갱신/OAuth 로직은 유지되어 언제든 재활성화 가능.
 
     dedup_key 지정 시 _should_send/_mark_sent로 중복 발송 차단.
     cooldown_hours=None 이면 영구 1회 (이미 보낸 키는 다시 안 보냄).
@@ -409,23 +425,27 @@ def _send_kakao_message(text: str,
         logger.info("[Notify] 중복 차단 (dedup_key=%s)", dedup_key)
         return False
 
-    # Discord는 카카오 성패와 무관하게 항상 시도 (이중화)
-    _send_discord_webhook(text)
-
-    env = load_env()
-    access_token = env.get("KAKAO_ACCESS_TOKEN", "")
+    # Discord는 항상 시도 (기본 채널)
+    discord_ok = _send_discord_webhook(text)
 
     kakao_ok = False
-    if access_token and _post_memo(access_token, text):
-        kakao_ok = True
-    else:
-        access_token = _refresh_kakao_access_token()
+    if _kakao_enabled():
+        env = load_env()
+        access_token = env.get("KAKAO_ACCESS_TOKEN", "")
         if access_token and _post_memo(access_token, text):
             kakao_ok = True
+        else:
+            access_token = _refresh_kakao_access_token()
+            if access_token and _post_memo(access_token, text):
+                kakao_ok = True
+    else:
+        logger.debug("[Notify] 카카오 비활성화 (config) — Discord 전용")
 
     if dedup_key:
-        _mark_sent(dedup_key)  # 카카오/디스코드 중 하나라도 시도했으면 dedup 기록
-    return kakao_ok
+        # 둘 중 하나라도 성공했으면 dedup 기록 (둘 다 실패면 다음 폴링에서 재시도)
+        if discord_ok or kakao_ok:
+            _mark_sent(dedup_key)
+    return kakao_ok or discord_ok
 
 
 def _is_english_name(name: str) -> bool:
@@ -453,8 +473,8 @@ def _convert_english_to_korean(name: str) -> Optional[str]:
     )
 
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        from modules.gemini_client import generate_content_with_fallback
+        response = generate_content_with_fallback(
             model="gemini-2.5-flash",
             config={"max_output_tokens": 50, "temperature": 0.1, "thinking_config": {"thinking_budget": 0}},
             contents=prompt,
@@ -549,7 +569,8 @@ def _build_stock_message(result: dict) -> Optional[str]:
         if total > 0:
             lines.append("")
             lines.append(f"총 {total:,}원")
-            lines.append("👉 쿠팡 앱에서 결제해주세요.")
+            # Discord 마크다운 하이퍼링크 (카카오에선 plain text 로 보임 — 현재 비활성)
+            lines.append("[👉 쿠팡 장바구니에서 결제하기](https://cart.coupang.com/cartView.pang)")
     except (TypeError, ValueError):
         pass
 

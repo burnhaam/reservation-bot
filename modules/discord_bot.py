@@ -84,10 +84,11 @@ def _apply_approval(item: dict) -> tuple[bool, str]:
     except Exception:
         logger.warning("[Discord] 매핑 백업 실패 (계속 진행)", exc_info=True)
 
+    # product_mapping.json 은 raw 포맷: {canonical: body, "_skip_items": {...}}
+    # alias_index/skip_index 는 load_mapping() 가 파생 생성하므로 파일에 저장하지 않음.
+
     if action == "mapping_add":
-        # 신규 매핑 추가
         if memo_item in mapping:
-            # 이미 키가 있으면 url만 갱신 + 별칭 보존
             mapping[memo_item]["url"] = suggested_url
             mapping[memo_item]["최근주문일"] = datetime.now().strftime("%Y-%m-%d")
             msg = f"'{memo_item}' URL 갱신"
@@ -318,6 +319,35 @@ def _register_commands(tree: app_commands.CommandTree) -> None:
         data["items"] = []
         _save_pending(data)
         await interaction.response.send_message(f"대기 건 {n}개 모두 삭제됨")
+
+    @tree.command(name="enable", description="비활성화된 매핑을 다시 활성화")
+    @app_commands.describe(item_name="활성화할 품목 이름 (매핑 키)")
+    async def enable(interaction: discord.Interaction, item_name: str):
+        if not MAPPING_PATH.exists():
+            await interaction.response.send_message("product_mapping.json 없음")
+            return
+        try:
+            mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            await interaction.response.send_message(f"매핑 로드 실패: {e}")
+            return
+        if item_name not in mapping or not isinstance(mapping.get(item_name), dict):
+            await interaction.response.send_message(f"매핑에 '{item_name}' 없음")
+            return
+        prev = mapping[item_name].get("자동주문_허용", True)
+        mapping[item_name]["자동주문_허용"] = True
+        try:
+            # 백업
+            backup = MAPPING_PATH.with_suffix(".json.bak")
+            backup.write_text(MAPPING_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+            MAPPING_PATH.write_text(
+                json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            await interaction.response.send_message(
+                f"'{item_name}' 자동주문 활성화 완료 (이전: {prev})"
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"저장 실패: {e}")
 
 
 # =============================================================

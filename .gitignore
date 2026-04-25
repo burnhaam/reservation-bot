@@ -33,6 +33,7 @@ data/samhaengsi_sent_events.json
 data/last_success.txt
 data/.pipeline.lock
 data/.vacuum_*
+data/scan_state.json
 
 # 주문내역 분석 엑셀 (개인 주문 정보 포함 가능)
 주문내역_분석_매핑표.xlsx

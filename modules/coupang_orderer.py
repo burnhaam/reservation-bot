@@ -607,16 +607,10 @@ def add_single_item(page, item: dict) -> dict:
                         continue
                 return {"status": "skipped", "reason": "품절"}
 
-            # 가격 검증 (매핑/이력 기준)
+            # 가격 추출 (로깅/알림용). 가격 초과 차단은 사용자 정책상 비활성.
             current_price = _extract_current_price(page)
             if current_price is None:
                 last_error = "가격 추출 실패"
-            elif max_price and current_price > max_price:
-                return {
-                    "status": "skipped",
-                    "reason": f"가격 초과 ({current_price:,}원 > 최대 {max_price:,}원)",
-                    "price": current_price,
-                }
 
             # 장바구니 담기 클릭
             if not _click_add_to_cart(page, cfg):

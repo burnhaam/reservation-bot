@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS stock_orders (
     status              TEXT    NOT NULL,            -- 'ordered' | 'skipped' | 'failed' | 'unmapped'
     skip_reason         TEXT,                        -- 스킵 사유
     fail_reason         TEXT,                        -- 실패 사유 + 스택트레이스 일부
-    ordered_at          TEXT                         -- 장바구니 담은 시각
+    ordered_at          TEXT,                        -- 장바구니 담은 시각
+    confirmed_at        TEXT,                        -- 실주문 확인 시각 (주문내역에 등장)
+    scan_done_at        TEXT                         -- 주문내역 스캔 완료 시각 (재스캔 방지)
 );
 """
 
@@ -65,6 +67,25 @@ CREATE_STOCK_INDEX_EVENT_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_stock_orders_event "
     "ON stock_orders(calendar_event_id, memo_hash);"
 )
+
+CREATE_STOCK_INDEX_SCAN_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_stock_orders_scan "
+    "ON stock_orders(scan_done_at, detected_at) "
+    "WHERE status = 'ordered';"
+)
+
+
+def _migrate_stock_orders_columns(conn: sqlite3.Connection) -> None:
+    """기존 DB에 confirmed_at / scan_done_at 컬럼이 없으면 추가한다.
+
+    ALTER TABLE은 트랜잭션 외부에서도 안전하며, 컬럼이 이미 존재하면 에러.
+    PRAGMA table_info로 먼저 확인 후 선택적으로 실행.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(stock_orders)")}
+    if "confirmed_at" not in cols:
+        conn.execute("ALTER TABLE stock_orders ADD COLUMN confirmed_at TEXT")
+    if "scan_done_at" not in cols:
+        conn.execute("ALTER TABLE stock_orders ADD COLUMN scan_done_at TEXT")
 
 
 def get_connection(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -96,7 +117,9 @@ def init_db(path: Path = DB_PATH) -> None:
     with get_connection(path) as conn:
         conn.execute(CREATE_TABLE_SQL)
         conn.execute(CREATE_STOCK_ORDERS_SQL)
+        _migrate_stock_orders_columns(conn)
         conn.execute(CREATE_STOCK_INDEX_ITEM_DATE_SQL)
         conn.execute(CREATE_STOCK_INDEX_STATUS_DATE_SQL)
         conn.execute(CREATE_STOCK_INDEX_EVENT_SQL)
+        conn.execute(CREATE_STOCK_INDEX_SCAN_SQL)
         conn.commit()
