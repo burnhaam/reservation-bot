@@ -284,6 +284,12 @@ def send_notification(reservation: dict, action: str) -> None:
     # Discord 병행 발송 (실패 무관)
     _send_discord_webhook(message)
 
+    if not _kakao_enabled():
+        logger.debug("[Notify] 카카오 비활성화 (config) — Discord 전용 (action=%s)", action)
+        if dedup_key:
+            _mark_sent(dedup_key)
+        return
+
     env = load_env()
     access_token = env.get("KAKAO_ACCESS_TOKEN", "")
 

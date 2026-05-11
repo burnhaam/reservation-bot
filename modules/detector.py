@@ -285,6 +285,7 @@ def detect_airbnb() -> list[dict]:
         results.append({"platform": "airbnb", "action": "new", **event})
 
     # 취소: DB에 있지만 iCal에서 사라짐 (이미 취소 처리된 건 제외)
+    cancel_candidates: list[dict] = []
     for booking_id, row in known.items():
         if booking_id in current_ids:
             continue
@@ -295,7 +296,7 @@ def detect_airbnb() -> list[dict]:
         if checkout and checkout < today:
             continue
 
-        results.append({
+        cancel_candidates.append({
             "platform": "airbnb",
             "action": "cancel",
             "booking_id": booking_id,
@@ -305,7 +306,71 @@ def detect_airbnb() -> list[dict]:
             "checkout": checkout,
         })
 
+    # 안전장치: iCal에서 사라진 예약은 automated@airbnb.com의 "취소됨:" 메일이
+    # 실제로 도착한 경우에만 취소로 반영. 메일이 없으면 iCal 서버 오류로 간주하고
+    # 침묵 무시 (알림 없음).
+    if cancel_candidates:
+        email_checkins = _airbnb_cancel_email_checkins()
+        for cand in cancel_candidates:
+            ci = cand.get("checkin")
+            if ci and ci in email_checkins:
+                results.append(cand)
+            else:
+                logger.warning(
+                    "[Airbnb] 취소 후보 무시 — 취소 메일 미수신 (booking_id=%s, checkin=%s, name=%s)",
+                    cand.get("booking_id"), ci, cand.get("guest_name"),
+                )
+
     return results
+
+
+def _airbnb_cancel_email_checkins(window_days: int = 7) -> set[date]:
+    """최근 N일 이내 Airbnb 취소 메일에서 체크인 날짜 집합을 추출.
+
+    제목 형식 예: "취소됨: 2026년 7월 26일~31일 예약 건(HMNFDN5YZS)"
+    """
+    try:
+        service = _get_gmail_service()
+    except Exception:
+        logger.warning("[Airbnb] Gmail 서비스 초기화 실패 — 취소 메일 검증 불가, 모든 취소 후보 무시")
+        return set()
+
+    query = f'from:automated@airbnb.com subject:"취소됨" newer_than:{window_days}d'
+    try:
+        list_resp = service.users().messages().list(
+            userId="me", q=query, maxResults=50
+        ).execute()
+        message_refs = list_resp.get("messages", [])
+    except Exception as e:
+        logger.warning("[Airbnb] Gmail 취소 메일 조회 실패: %s", e)
+        return set()
+
+    checkins: set[date] = set()
+    for ref in message_refs:
+        try:
+            msg = service.users().messages().get(
+                userId="me", id=ref["id"], format="metadata",
+                metadataHeaders=["Subject"],
+            ).execute()
+        except Exception:
+            continue
+        headers = {
+            h["name"]: h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+        subject = headers.get("Subject", "")
+        m = re.search(r"취소됨:\s*(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", subject)
+        if not m:
+            continue
+        try:
+            checkins.add(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            continue
+
+    if checkins:
+        logger.info("[Airbnb] 최근 %d일 취소 메일 체크인 %d건: %s",
+                    window_days, len(checkins), sorted(checkins))
+    return checkins
 
 
 # =============================================================

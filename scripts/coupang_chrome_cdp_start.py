@@ -84,8 +84,9 @@ def main():
         "--disable-features=Translate",
         # 시각적 방해 최소화 (작업표시줄 아이콘만 보임).
         # headless는 Akamai가 차단하므로 안 됨 — minimized로 우회.
-        "--start-minimized",
-        "--window-position=10000,10000",  # 화면 밖에 위치 (혹시 복원돼도 안 보임)
+        #"--start-minimized",
+        #"--window-position=10000,10000",  # 화면 밖에 위치 (혹시 복원돼도 안 보임)
+        "--start-maximized",
         "https://www.coupang.com",
     ]
 

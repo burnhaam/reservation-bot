@@ -771,6 +771,17 @@ def find_orders_containing_items(
                         if (bestAnchors.length === 0) continue;
                         const seenIds = new Set();
                         const products = [];
+                        // 수량 추출: 앵커 주변 텍스트에서 '수량 N' 매치. 실패 시 null.
+                        const _extractQty = (anchor) => {
+                            let cur = anchor.parentElement;
+                            for (let lvl = 0; lvl < 6 && cur; lvl++) {
+                                const txt = (cur.innerText || '').replace(/\s+/g, ' ');
+                                const m = txt.match(/수량\s*[:：]?\s*(\d+)\s*개?/);
+                                if (m) return parseInt(m[1], 10);
+                                cur = cur.parentElement;
+                            }
+                            return null;
+                        };
                         for (const a of bestAnchors) {
                             const title = (a.innerText || a.textContent || '').trim();
                             if (!title || title.length < 3) continue;
@@ -783,6 +794,7 @@ def find_orders_containing_items(
                                 title: title.slice(0, 200),
                                 sdp_href: href,
                                 vendor_item_id: m2 ? m2[1] : "",
+                                quantity: _extractQty(a),
                             });
                         }
                         if (products.length === 0) continue;
@@ -852,8 +864,37 @@ def find_orders_containing_items(
     return result
 
 
+def _canonical_product_url(url: str) -> str:
+    """비교/저장용 URL 정규화. /vp/products/PROD?itemId=N&vendorItemId=M 만 유지.
+
+    쿠팡은 vendorItemId(변형 선택, 예: 향·색·팩사이즈) 가 빠지면 상품 페이지가 기본
+    옵션으로 폴백되어 사용자가 실제 산 변형과 다른 페이지로 안내됨. 따라서 비교/저장
+    모두 vendorItemId 를 포함해야 하며, 추적/세션 파라미터(sid, searchId 등) 는 제거.
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse, parse_qs, urlencode
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        keep: list[tuple[str, str]] = []
+        for k in ("itemId", "vendorItemId"):
+            vals = qs.get(k) or []
+            if vals and vals[0]:
+                keep.append((k, vals[0]))
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        if keep:
+            return base + "?" + urlencode(keep)
+        return base
+    except Exception:
+        return (url or "").split("?")[0]
+
+
 def resolve_product_url(page, sdp_href: str) -> Optional[str]:
-    """sdp/link URL → redirect 따라가 /vp/products/XXX 획득. 실패 시 None."""
+    """sdp/link URL → redirect 따라가 /vp/products/XXX 획득. 실패 시 None.
+
+    반환 URL 은 _canonical_product_url 로 정규화 — itemId/vendorItemId 보존, 그 외 제거.
+    """
     if not sdp_href or page is None:
         return None
 
@@ -873,7 +914,7 @@ def resolve_product_url(page, sdp_href: str) -> Optional[str]:
 
     if "/vp/products/" not in final:
         return None
-    return final.split("?")[0]
+    return _canonical_product_url(final)
 
 
 # =============================================================
@@ -1016,23 +1057,43 @@ JSON 한 줄로만 답변:"""
 
 
 def _stock_ordered_last_n_days(n_days: int = 14) -> list[dict]:
-    """stock_orders 최근 N일 (item_name, matched_url, status) 반환.
+    """stock_orders 최근 N일 (item_name, matched_url, status, quantity) 반환.
 
     ordered/skipped/failed 모두 포함 — 품절로 skip 된 품목도 실주문에서 대체 URL을
     발견하면 mapping_update 후보가 되므로 학습 대상에 넣음. unmapped 는 원래 매핑이
     없으니 제외.
+
+    quantity: 봇이 cart 처리 시 사용한 수량 (매핑의 기본수량 또는 max_stock 기반).
     """
     from modules.db import get_connection
     try:
         with get_connection() as conn:
+            # detected_at 은 'YYYY-MM-DDTHH:MM:SS.ffffff' (datetime.now().isoformat()),
+            # datetime('now', ?) 은 'YYYY-MM-DD HH:MM:SS' — 같은 날짜에서 'T'(84) > ' '(32)
+            # 로 문자열 비교가 어긋남. 양쪽 datetime() 으로 정규화.
             cur = conn.execute(
-                "SELECT DISTINCT item_name, matched_url, status "
+                "SELECT item_name, matched_url, status, quantity, detected_at "
                 "FROM stock_orders "
                 "WHERE status IN ('ordered', 'skipped', 'failed') "
-                "AND detected_at >= datetime('now', ?)",
+                "AND datetime(detected_at) >= datetime('now', ?) "
+                "ORDER BY detected_at DESC",
                 (f"-{int(n_days)} days",),
             )
-            return [dict(r) for r in cur.fetchall()]
+            # 동일 item_name 의 가장 최근 1건만 유지 (DISTINCT 대신 ORDER + 첫 발견 dedup)
+            seen: set[str] = set()
+            rows: list[dict] = []
+            for r in cur.fetchall():
+                nm = r["item_name"]
+                if not nm or nm in seen:
+                    continue
+                seen.add(nm)
+                rows.append({
+                    "item_name": nm,
+                    "matched_url": r["matched_url"],
+                    "status": r["status"],
+                    "quantity": r["quantity"],
+                })
+            return rows
     except Exception:
         logger.exception("[Matcher:Sync] stock_orders 조회 실패")
         return []
@@ -1046,7 +1107,8 @@ def _stock_unmapped_last_n_days(n_days: int = 14) -> list[str]:
             cur = conn.execute(
                 "SELECT DISTINCT item_name "
                 "FROM stock_orders "
-                "WHERE status = 'unmapped' AND detected_at >= datetime('now', ?)",
+                "WHERE status = 'unmapped' "
+                "AND datetime(detected_at) >= datetime('now', ?)",
                 (f"-{int(n_days)} days",),
             )
             return [r["item_name"] for r in cur.fetchall() if r["item_name"]]
@@ -1069,11 +1131,11 @@ def _stock_orders_pending_scan(min_age_days: int = 3) -> list[dict]:
     try:
         with get_connection() as conn:
             cur = conn.execute(
-                "SELECT id, item_name, matched_url, status, detected_at "
+                "SELECT id, item_name, matched_url, status, quantity, detected_at "
                 "FROM stock_orders "
                 "WHERE status IN ('ordered', 'skipped', 'failed') "
                 "AND scan_done_at IS NULL "
-                "AND detected_at <= datetime('now', ?)",
+                "AND datetime(detected_at) <= datetime('now', ?)",
                 (f"-{int(min_age_days)} days",),
             )
             return [dict(r) for r in cur.fetchall()]
@@ -1178,8 +1240,21 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
 
     # --- 모드별 대상 집합 결정 ---
     name_to_ids: dict[str, list[int]] = {}
-    # skipped/failed 품목 — mapping_update 후보 판정용 (인덱스: item_name → 현재 매핑 URL)
-    skipped_names_to_current_url: dict[str, str] = {}
+    # mapping_update 후보 판정용 인덱스. ordered/skipped/failed 모두 대상:
+    # - ordered: 봇이 cart 에 담았으나 사용자가 실제론 다른 URL/수량 으로 결제했을 가능성
+    # - skipped: 봇은 품절로 건너뜀, 사용자는 다른 URL 로 직접 주문했을 가능성
+    # - failed:  봇은 담기 실패, 사용자가 수동으로 다른 URL 로 주문했을 가능성
+    # value: {"url": 봇 matched_url, "status": stock_orders.status, "quantity": 봇 quantity}
+    current_url_by_name: dict[str, dict] = {}
+
+    def _track_current(nm: str, url: str, status: str, qty: Optional[int]) -> None:
+        if nm and status in ("ordered", "skipped", "failed"):
+            # 가장 마지막 기록 유지 (동일 name 여러 건)
+            current_url_by_name[nm] = {
+                "url": url or "",
+                "status": status,
+                "quantity": qty,
+            }
 
     if mode == "scheduled":
         pending_records = _stock_orders_pending_scan(min_age_days=3)
@@ -1190,10 +1265,10 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             nm = r.get("item_name")
             if nm:
                 name_to_ids.setdefault(nm, []).append(r["id"])
-                if r.get("status") in ("skipped", "failed"):
-                    # 가장 마지막 matched_url 유지 (동일 name 여러 건)
-                    if r.get("matched_url"):
-                        skipped_names_to_current_url[nm] = r["matched_url"]
+                _track_current(
+                    nm, r.get("matched_url") or "", r.get("status") or "",
+                    r.get("quantity"),
+                )
         ordered_names = set(name_to_ids.keys())
         if not ordered_names:
             logger.info("[Matcher:Sync] 미확정 레코드에 item_name 없음 — 스킵")
@@ -1205,8 +1280,10 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             return result
         ordered_names = {o["item_name"] for o in ordered if o.get("item_name")}
         for o in ordered:
-            if o.get("status") in ("skipped", "failed") and o.get("item_name") and o.get("matched_url"):
-                skipped_names_to_current_url[o["item_name"]] = o["matched_url"]
+            _track_current(
+                o.get("item_name") or "", o.get("matched_url") or "",
+                o.get("status") or "", o.get("quantity"),
+            )
 
     # --- 검색 기반 묶음 수집 (기본 페이지 5건 한계 회피) ---
     groups = find_orders_containing_items(page, sorted(ordered_names), lookback_days=lookback_days)
@@ -1252,27 +1329,26 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
                 unmatched_products.append(prod)
 
         # Phase 2: Gemini similarity — 이미 사업용으로 확정된 묶음(substring 매치 있음)에서만.
-        # skipped/failed 품목은 봇이 담기 실패했으므로 "커피캡슐" 같은 축약형이
-        # 실주문 타이틀 "네스프레소 버츄오 볼테소 캡슐커피"와 substring 매치 안 됨.
-        # 유사도로 보완해 mapping_update 후보로 연결.
-        if matched_names and skipped_names_to_current_url:
+        # 봇이 알고 있는 모든 status(ordered/skipped/failed) 의 축약 이름이
+        # 실주문 타이틀과 substring 매치 안 될 때 유사도로 보완해 mapping_update 후보로 연결.
+        if matched_names and current_url_by_name:
             still_unmatched = []
             for prod in unmatched_products:
-                similar_skipped = None
-                for skipped_name in skipped_names_to_current_url:
-                    if skipped_name in matched_names:
+                similar_name = None
+                for tracked_name in current_url_by_name:
+                    if tracked_name in matched_names:
                         continue  # 이미 substring 매치됨
-                    sim = _gemini_similarity_check(skipped_name, prod["title"])
+                    sim = _gemini_similarity_check(tracked_name, prod["title"])
                     if sim["same"] and sim["confidence"] in ("high", "medium"):
-                        similar_skipped = skipped_name
+                        similar_name = tracked_name
                         logger.info(
                             "[Matcher:Sync] Gemini 유사 매칭: '%s' ≈ '%s' (%s)",
-                            skipped_name, prod["title"][:40], sim["confidence"],
+                            tracked_name, prod["title"][:40], sim["confidence"],
                         )
                         break
-                if similar_skipped:
-                    matched_names.add(similar_skipped)
-                    matched_product_by_name.setdefault(similar_skipped, prod)
+                if similar_name:
+                    matched_names.add(similar_name)
+                    matched_product_by_name.setdefault(similar_name, prod)
                 else:
                     still_unmatched.append(prod)
             unmatched_products = still_unmatched
@@ -1284,46 +1360,92 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
         logger.info("[Matcher:Sync] 사업용 주문 [%s] 확인=%d, 새 상품=%d",
                     order_date, len(matched_names), len(unmatched_products))
 
-        # === mapping_update 제안 (skipped/failed 품목에서 실제 주문된 상품 URL 발견) ===
+        # === mapping_update 제안 (ordered/skipped/failed 품목의 실주문 URL/수량 이 다를 때) ===
+        _STATUS_PHRASE = {
+            "ordered": "봇이 매핑 URL 로 담기 성공",
+            "skipped": "봇은 담기 건너뜀(품절 등)",
+            "failed":  "봇은 담기 실패",
+        }
         for name in matched_names:
             if name in update_proposed:
                 continue
-            current_url = skipped_names_to_current_url.get(name)
-            if not current_url:
+            entry = current_url_by_name.get(name)
+            if not entry:
                 continue
+            current_url = entry["url"]
+            current_status = entry["status"]
+            current_qty = entry.get("quantity")
             prod = matched_product_by_name.get(name)
             if not prod:
                 continue
             new_url = resolve_product_url(page, prod["sdp_href"])
             if not new_url:
                 continue
-            # URL 비교 (파라미터 제거 후)
-            cur_clean = current_url.split("?")[0].rstrip("/")
-            new_clean = new_url.split("?")[0].rstrip("/")
-            if cur_clean == new_clean:
-                continue  # 동일 상품, 업데이트 불필요
-            # mapping_update 승인 대기
+            # URL 비교 — _canonical_product_url 로 itemId/vendorItemId 보존한 채 비교.
+            #   다른 product code → 다른 상품 / 같은 code 라도 다른 vendorItemId →
+            #   사용자가 실제로 산 변형(향·색·팩사이즈)이 봇 매핑과 다른 케이스.
+            cur_canon = _canonical_product_url(current_url)
+            new_canon = _canonical_product_url(new_url)
+            url_diff = bool(cur_canon != new_canon and new_canon)
+
+            # 수량 비교 — 사용자가 실제로 담은 수량이 봇이 사용한 수량과 다를 때
+            # 매핑 기본수량 업데이트 후보.
+            new_qty_raw = prod.get("quantity")
+            try:
+                new_qty = int(new_qty_raw) if new_qty_raw is not None else None
+            except (TypeError, ValueError):
+                new_qty = None
+            try:
+                cur_qty_int = int(current_qty) if current_qty is not None else None
+            except (TypeError, ValueError):
+                cur_qty_int = None
+            qty_diff = bool(
+                new_qty is not None and new_qty > 0
+                and cur_qty_int is not None
+                and new_qty != cur_qty_int
+            )
+
+            if not (url_diff or qty_diff):
+                continue  # 동일 상품·동일 수량, 업데이트 불필요
+
+            # mapping_update 승인 대기 (URL diff / qty diff / 둘 다)
             from modules.discord_bot import add_pending
+            status_phrase = _STATUS_PHRASE.get(current_status, "봇 처리 결과")
+            reason_parts = [f"'{name}' {status_phrase}",
+                            f"실주문({order_date}): '{prod['title'][:50]}'"]
+            if url_diff:
+                reason_parts.append("URL 교체?")
+            if qty_diff:
+                reason_parts.append(f"기본수량 {cur_qty_int}→{new_qty}?")
             pid = add_pending(
                 item_type="mapping_update",
                 memo_item=name,
-                current_url=current_url,
-                suggested_url=new_url,
-                reason=(
-                    f"'{name}' 봇은 담기 실패/품절. "
-                    f"실주문({order_date})에 '{prod['title'][:50]}' 발견 — URL 교체?"
-                ),
+                current_url=current_url if url_diff else "",
+                suggested_url=new_url if url_diff else "",
+                current_quantity=cur_qty_int if qty_diff else None,
+                suggested_quantity=new_qty if qty_diff else None,
+                reason=". ".join(reason_parts),
             )
             result["pending"].append({
                 "id": pid, "title": name, "action": "update",
-                "current_url": current_url, "suggested_url": new_url,
+                "current_url": current_url if url_diff else "",
+                "suggested_url": new_url if url_diff else "",
+                "current_quantity": cur_qty_int if qty_diff else None,
+                "suggested_quantity": new_qty if qty_diff else None,
             })
             result["updated"].append({
-                "title": name, "current_url": current_url, "suggested_url": new_url,
+                "title": name,
+                "current_url": current_url, "suggested_url": new_url,
+                "current_quantity": cur_qty_int, "suggested_quantity": new_qty,
+                "url_diff": url_diff, "qty_diff": qty_diff,
                 "order_date": order_date,
             })
             update_proposed.add(name)
-            logger.info("[Matcher:Sync] mapping_update 대기: #%d %s", pid, name[:40])
+            diff_label = " + ".join(
+                d for d in (("URL" if url_diff else ""), ("qty" if qty_diff else "")) if d
+            )
+            logger.info("[Matcher:Sync] mapping_update 대기: #%d %s (%s)",
+                        pid, name[:40], diff_label)
 
         # === 로직 ① — 신규 상품 자동 매핑 (사업용 확정 묶음) ===
         for prod in unmatched_products:
@@ -1481,7 +1603,7 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
                 for u in result["updated"][:10]:
                     lines.append(f"  • {u['title'][:40]} → 실주문 URL")
             if result["pending"]:
-                lines.append(f"\n승인 대기 {len(result['pending'])}건 — `/list` 후 `/approve <id>`")
+                lines.append(f"\n승인 대기 {len(result['pending'])}건 — 아래 매핑 메시지의 [✅ 매핑 승인] / [❌ 매핑 거절] 버튼으로 처리하세요.")
                 for p in result["pending"][:10]:
                     lines.append(f"  • #{p['id']} [{p.get('action', '?')}] {p.get('title', '')[:50]}")
             _send_discord_webhook("\n".join(lines))
