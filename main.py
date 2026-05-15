@@ -8,8 +8,8 @@
     2) SQLite DB 초기화 (reservations 테이블 없으면 생성)
     3) detector.detect_new_reservations() — 네이버/에어비앤비 감지
     4) 각 예약에 대해:
-        - 신규:  캘린더 등록 → DB INSERT → 반대 플랫폼 차단 → 카카오 알림
-        - 취소:  캘린더 삭제 → DB UPDATE → 반대 플랫폼 해제 → 카카오 알림
+        - 신규:  캘린더 등록 → DB INSERT → 반대 플랫폼 차단 → Discord 알림
+        - 취소:  캘린더 삭제 → DB UPDATE → 반대 플랫폼 해제 → Discord 알림
     5) 처리 건수 요약 로그
 
 개별 예약 처리 중 예외가 발생해도 나머지는 계속 처리되며,
@@ -116,7 +116,7 @@ _STOCK_MAX_DAILY_ORDERS_DEFAULT = 5
 # =============================================================
 
 def _global_exception_handler(exc_type, exc_value, exc_traceback):
-    """sys.excepthook. 예기치 못한 예외를 critical 로그 + 카카오 긴급 알림으로 보고.
+    """sys.excepthook. 예기치 못한 예외를 critical 로그 + Discord 긴급 알림으로 보고.
 
     KeyboardInterrupt(사용자 Ctrl+C)는 기본 처리로 위임한다.
     알림 자체가 실패해도 재귀 예외로 번지지 않도록 swallow.
@@ -226,7 +226,7 @@ def _handle_new(reservation: dict) -> bool:
     if platform == "naver":
         blocker.block_airbnb(reservation)
 
-    # d) 카카오 알림
+    # d) Discord 알림
     notifier.send_notification(reservation, "created")
 
     logger.info("[신규] %s/%s 처리 완료", platform, booking_id)
@@ -272,7 +272,7 @@ def _handle_cancel(reservation: dict) -> bool:
     elif platform == "airbnb":
         blocker.unblock_naver(reservation)
 
-    # e) 카카오 알림
+    # e) Discord 알림
     notifier.send_notification(reservation, "deleted")
     logger.info("[취소] %s/%s 처리 완료", platform, booking_id)
     return True
@@ -394,8 +394,8 @@ def _handle_airbnb_modifications() -> int:
                 )
                 conn.commit()
 
-            # 카카오 알림 (영구 1회)
-            notifier._send_kakao_message(
+            # Discord 알림 (영구 1회)
+            notifier._send_message(
                 f"[예약 변경 확정] {guest_name}님\n"
                 f"📅 기존: {old_checkin}~{old_checkout}\n"
                 f"📅 변경: {new_checkin}~{new_checkout}\n"
@@ -528,7 +528,7 @@ def _detect_ical_date_changes() -> int:
             conn.commit()
 
         guest_name = row["guest_name"] or "게스트"
-        notifier._send_kakao_message(
+        notifier._send_message(
             f"[예약 변경 확정] {guest_name}님\n"
             f"📅 기존: {db_ci}~{db_co}\n"
             f"📅 변경: {ical_ci}~{ical_co}\n"
@@ -548,7 +548,7 @@ def _detect_ical_date_changes() -> int:
 # =============================================================
 
 def _alert_stale_reservations() -> None:
-    """24시간 이상 이름/인원 미확인 예약이 있으면 카카오 알림 (일회성)."""
+    """24시간 이상 이름/인원 미확인 예약이 있으면 Discord 알림 (일회성)."""
     with get_connection() as conn:
         cur = conn.execute(
             "SELECT booking_id, guest_name, checkin FROM reservations "
@@ -563,7 +563,7 @@ def _alert_stale_reservations() -> None:
         return
 
     names = ", ".join(f"{r['checkin']} {r['guest_name']}" for r in rows[:5])
-    notifier._send_kakao_message(
+    notifier._send_message(
         f"[미처리 예약 {len(rows)}건] 24시간 경과, 수동 확인 필요: {names}"
     )
 
@@ -619,13 +619,14 @@ def _cleanup_cancelled_events() -> int:
 
 
 # =============================================================
-# 체크인 D-1 3행시 발송 (오전 8~9시)
+# 체크인 당일 3행시 발송 (오전 8~9시, 11~12시 fallback)
 # =============================================================
 
 # DB에 없는 수기 등록 예약도 태우기 위해 소유 캘린더도 스캔한다.
-# 제목 포맷 예: "네. 최진 2인", "에. 김철수. 3인", "알. Junyeon 2명"
+# 제목 포맷 예: "네. 최진 2인", "에. 김철수. 3인", "에. 진성 김 / 3인", "알. Junyeon 2명"
+# 이름~인원 사이 구분자는 . / ． 모두 허용 (수기 등록 변형 대응).
 _SAMHAENGSI_CALENDAR_TITLE_PAT = re.compile(
-    r"^\s*([네에알])\s*[.．]\s*(.+?)\s*[.．]?\s*(\d+)\s*[명인]\s*$"
+    r"^\s*([네에알])\s*[.．]\s*(.+?)\s*[.．/]?\s*(\d+)\s*[명인]\s*$"
 )
 _SAMHAENGSI_STATE_PATH = PROJECT_ROOT / "data" / "samhaengsi_sent_events.json"
 
@@ -646,8 +647,14 @@ def _save_samhaengsi_calendar_state(state: dict) -> None:
         json.dump(pruned, f, ensure_ascii=False, indent=2)
 
 
-def _send_samhaengsi_from_calendar(target_date: date) -> int:
-    """소유 캘린더에서 target_date 체크인 예약 이벤트를 찾아 3행시 발송. DB 외 건 보강용."""
+def _send_samhaengsi_from_calendar(target_date: date, skip_names=None) -> int:
+    """소유 캘린더에서 target_date 체크인 예약 이벤트를 찾아 3행시 발송. DB 외 건 보강용.
+
+    skip_names: 같은 날짜 DB에서 이미 처리(또는 곧 처리)될 손님 이름 set.
+        봇이 생성한 예약은 DB+캘린더 양쪽에 존재해서 양쪽 코드 경로가 중복 발송하는
+        문제를 막기 위해, 매치된 이름이 skip_names에 있으면 발송을 건너뛰되 state에는
+        기록해서 다음 실행에서 재검사도 안 하도록 한다.
+    """
     config = load_config()
     owner_cal = config.get("naver_owner_calendar", "")
     if not owner_cal:
@@ -657,6 +664,7 @@ def _send_samhaengsi_from_calendar(target_date: date) -> int:
     if not events:
         return 0
 
+    skip_names = skip_names or set()
     state = _load_samhaengsi_calendar_state()
     sent = 0
 
@@ -671,6 +679,13 @@ def _send_samhaengsi_from_calendar(target_date: date) -> int:
         if not name or name == "(예약됨)":
             continue
 
+        if name in skip_names:
+            state[event_id] = target_date.isoformat()
+            _save_samhaengsi_calendar_state(state)
+            logger.info("[3행시] 캘린더 fallback 스킵 (DB에 동일 이름 존재): %s (event=%s…)",
+                        name, event_id[:24])
+            continue
+
         notifier.send_samhaengsi(name)
         state[event_id] = target_date.isoformat()
         _save_samhaengsi_calendar_state(state)
@@ -682,13 +697,19 @@ def _send_samhaengsi_from_calendar(target_date: date) -> int:
 
 
 def _send_checkin_day_samhaengsi() -> int:
-    """내일 체크인 예약에 3행시 전송. 오전 8~9시에만 실행 (FORCE_SAMHAENGSI=1 시 우회)."""
+    """오늘 체크인 예약에 3행시 전송.
+
+    오전 8~9시(정규) 또는 11~12시(8시 실패 시 안전망)에 실행.
+    samhaengsi_sent 플래그와 캘린더 state 가 중복 발송을 막으므로 11시 회차는
+    8시에 성공한 건을 다시 보내지 않는다. FORCE_SAMHAENGSI=1 시 시간 우회.
+    """
     now = datetime.now()
-    if not (8 <= now.hour < 9) and not os.environ.get("FORCE_SAMHAENGSI"):
+    in_window = (8 <= now.hour < 9) or (11 <= now.hour < 12)
+    if not in_window and not os.environ.get("FORCE_SAMHAENGSI"):
         return 0
 
-    tomorrow = date.today() + timedelta(days=1)
-    tomorrow_str = tomorrow.isoformat()
+    today = date.today()
+    today_str = today.isoformat()
     sent = 0
 
     with get_connection() as conn:
@@ -696,9 +717,23 @@ def _send_checkin_day_samhaengsi() -> int:
             "SELECT booking_id, guest_name FROM reservations "
             "WHERE checkin = ? AND status = 'confirmed' "
             "  AND (samhaengsi_sent IS NULL OR samhaengsi_sent = 0)",
-            (tomorrow_str,),
+            (today_str,),
         )
         rows = [dict(r) for r in cur.fetchall()]
+
+    # 캘린더 fallback에 넘길 skip 이름: 같은 날 confirmed 예약의 모든 이름.
+    # 이미 보낸 건(samhaengsi_sent=1)도 포함해야 next run에서도 캘린더가 다시 안 보냄.
+    db_names_for_date: set = set()
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT guest_name FROM reservations "
+            "WHERE checkin = ? AND status = 'confirmed'",
+            (today_str,),
+        )
+        for r in cur.fetchall():
+            gn = (r["guest_name"] or "").strip()
+            if gn and gn != "(예약됨)":
+                db_names_for_date.add(gn)
 
     for row in rows:
         guest_name = row.get("guest_name", "")
@@ -718,7 +753,7 @@ def _send_checkin_day_samhaengsi() -> int:
         sent += 1
 
     try:
-        sent += _send_samhaengsi_from_calendar(tomorrow)
+        sent += _send_samhaengsi_from_calendar(today, skip_names=db_names_for_date)
     except Exception:
         logger.exception("[3행시/캘린더] 보조 소스 처리 중 예외")
 
@@ -907,7 +942,7 @@ def run_pipeline() -> int:
             stat_modify = 0
             logger.exception("예약 변경 처리 중 예외")
 
-        # 체크인 D-1 3행시 발송 (8~9시)
+        # 체크인 당일 3행시 발송 (8~9시 정규 / 11~12시 안전망)
         try:
             stat_samhaengsi = _send_checkin_day_samhaengsi()
         except Exception:
@@ -1088,7 +1123,7 @@ def run_stock_pipeline() -> int:
       3) 중복/한도 필터링
       4) 매핑표 + 주문내역 매칭
       5) Playwright 장바구니 담기 (가격 검증 포함)
-      6) 카카오 결과 알림 + DB 기록
+      6) Discord 결과 알림 + DB 기록
     반환: 처리한 후보 메모 건수 (없으면 0).
     """
     try:
@@ -1352,7 +1387,7 @@ def run_stock_pipeline() -> int:
 
         _record_stock_order(row)
 
-    # 5) 카카오 결과 알림 (처리 0건이면 notifier에서 발송 생략)
+    # 5) Discord 결과 알림 (처리 0건이면 notifier에서 발송 생략)
     notify_payload = {
         "success": order_result.get("success", []),
         "skipped": skipped_rows + order_result.get("skipped", []),
@@ -1652,7 +1687,7 @@ def setup_check() -> int:
     print("=" * 60)
 
     # 1) .env 필수 항목
-    print("\n[1/4] .env 필수 환경변수")
+    print("\n[1/3] .env 필수 환경변수")
     env = load_env()
     for key in ENV_KEYS:
         value = env.get(key, "")
@@ -1664,7 +1699,7 @@ def setup_check() -> int:
             issues.append(f".env의 {key}를 채워주세요.")
 
     # 2) DB 접근
-    print("\n[2/4] SQLite DB 접근")
+    print("\n[2/3] SQLite DB 접근")
     try:
         init_db()
         with get_connection() as conn:
@@ -1675,7 +1710,7 @@ def setup_check() -> int:
         issues.append("DB 파일 권한 또는 스키마를 확인해주세요.")
 
     # 3) 구글 캘린더 API 토큰 유효성
-    print("\n[3/4] 구글 캘린더 API 토큰")
+    print("\n[3/3] 구글 캘린더 API 토큰")
     try:
         gsvc = calendar._get_google_calendar_service()  # noqa: SLF001
         cals = gsvc.calendarList().list(maxResults=1).execute()
@@ -1687,20 +1722,7 @@ def setup_check() -> int:
         print(f"   [FAIL] 예외: {e}")
         issues.append("구글 캘린더 토큰 점검 중 예외 발생.")
 
-    # 4) 카카오 메모 API 토큰 유효성
-    print("\n[4/4] 카카오 메모 API 토큰")
-    try:
-        token = notifier._refresh_kakao_access_token()  # noqa: SLF001
-        if token:
-            print("   [OK]   refresh_token → access_token 갱신 성공")
-        else:
-            print("   [FAIL] 토큰 갱신 실패 (로그 확인)")
-            issues.append("KAKAO_REST_API_KEY / KAKAO_REFRESH_TOKEN 확인.")
-    except Exception as e:
-        print(f"   [FAIL] 예외: {e}")
-        issues.append("카카오 토큰 점검 중 예외 발생.")
-
-    # 5) 재고 자동주문 시스템
+    # 4) 재고 자동주문 시스템
     try:
         stock_issues = _setup_check_stock()
         issues.extend(stock_issues)
