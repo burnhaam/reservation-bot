@@ -1003,6 +1003,14 @@ def run_pipeline() -> int:
             stat_update = 0
             logger.exception("pending 재시도 중 예외")
 
+        # 확정 후 인원/이름 보정: 웹훅 즉시확정이 Gmail 색인 지연으로 기본 인원(또는
+        # placeholder 이름)을 박은 건을, 색인된 메일로 다시 맞춘다. merge-before-create
+        # 이후에도 webhook→finalize가 초 단위라 갓 도착한 메일을 못 읽는 경우가 있어 필요.
+        try:
+            stat_update += _update_reservations_from_gmail()
+        except Exception:
+            logger.exception("Gmail 인원/이름 보정 중 예외")
+
         # 네이버 하루 1회 백업 스윕 (양쪽 폰 모두 웹훅 누락 시 복구)
         try:
             _run_naver_backup_sweep_if_due()

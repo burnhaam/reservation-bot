@@ -162,8 +162,17 @@ def _handle_new_reservation(reservation: dict) -> dict:
     booking_id = reservation["booking_id"]
     platform = reservation["platform"]
 
-    if not reservation_flow.claim_pending(reservation):
+    claim = reservation_flow.claim_pending(reservation)
+    if not claim:
         return {"status": "skip", "reason": "duplicate_or_exists", "booking_id": booking_id}
+
+    # 재예약(revive)은 즉시 확정하지 않는다: 방금 도착한 메일이 Gmail 검색에 아직
+    # 색인되기 전이라, 같은 날짜의 옛 메일(취소된 원예약)을 잘못 읽어 stale 인원으로
+    # 확정될 수 있다. pending 으로 두면 워처(1분)가 색인 완료 후 최신 메일로 확정한다.
+    if claim == "revived":
+        logger.info("[Webhook] 재예약 revive — 즉시확정 보류, 워처(1분) 재시도 대기: %s/%s",
+                    platform, booking_id)
+        return {"status": "ok", "action": "revived_pending", "booking_id": booking_id}
 
     status = reservation_flow.finalize_if_ready(booking_id)
     logger.info("[Webhook] 신규 claim: %s/%s → %s", platform, booking_id, status)

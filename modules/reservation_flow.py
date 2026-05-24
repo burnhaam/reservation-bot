@@ -75,11 +75,18 @@ def _age_minutes(created_at: Optional[str]) -> Optional[float]:
 # 트리거 → pending_email 로 claim (중복 방지)
 # =============================================================
 
-def claim_pending(reservation: dict) -> bool:
+def claim_pending(reservation: dict) -> str:
     """트리거된 예약을 pending_email 상태로 원자적 등록.
 
+    반환:
+      "new"     — 신규 INSERT 성공.
+      "revived" — 취소된 동일 booking_id를 되살림(재예약). 호출부는 즉시 finalize 하지 말고
+                  pending 으로 두어 워처(1분)가 Gmail 색인 완료 후 최신 메일로 확정하게 한다.
+                  (재예약 직후엔 같은 날짜의 옛 메일이 잘못 읽혀 stale 인원으로 확정되는 race 방지)
+      ""        — 중복/유효성 실패 등으로 skip (falsy).
+
     같은 체크인의 비취소 예약이 이미 있으면(다른 폰 웹훅, 또는 웹훅+iCal 중복 트리거)
-    중복으로 보고 False. 신규 등록에 성공하면 True.
+    중복으로 보고 "" 반환.
 
     단일 숙소 가정: 같은 체크인 날짜에 동시에 두 건의 서로 다른 예약은 없다.
     """
@@ -89,7 +96,7 @@ def claim_pending(reservation: dict) -> bool:
     checkout = reservation.get("checkout")
     if not (platform and booking_id and isinstance(checkin, date) and isinstance(checkout, date)):
         logger.error("[Flow] claim_pending: 유효하지 않은 예약 %s", reservation)
-        return False
+        return ""
 
     checkin_iso = checkin.isoformat()
     checkout_iso = checkout.isoformat()
@@ -111,7 +118,7 @@ def claim_pending(reservation: dict) -> bool:
                 "[Flow] 중복 트리거 skip: %s/%s (기존 %s/%s)",
                 platform, booking_id, existing["booking_id"], existing["status"],
             )
-            return False
+            return ""
 
         # 같은 booking_id가 취소 상태로 남아있으면(동일 건 재예약) 되살린다.
         # (위에서 비취소 동일 체크인은 이미 걸렀으므로 여기 걸리는 건 취소된 행뿐)
@@ -140,7 +147,7 @@ def claim_pending(reservation: dict) -> bool:
             ])
             logger.info("[Flow] 취소건 재예약 되살림: %s/%s (체크인 %s)",
                         platform, booking_id, checkin_iso)
-            return True
+            return "revived"
 
         conn.execute(
             "INSERT INTO reservations "
@@ -150,14 +157,14 @@ def claim_pending(reservation: dict) -> bool:
         )
         conn.execute("COMMIT")
         logger.info("[Flow] pending 등록: %s/%s (체크인 %s)", platform, booking_id, checkin_iso)
-        return True
+        return "new"
     except Exception:
         try:
             conn.execute("ROLLBACK")
         except Exception:
             pass
         logger.exception("[Flow] claim_pending 실패: %s/%s", platform, booking_id)
-        return False
+        return ""
     finally:
         conn.close()
 
