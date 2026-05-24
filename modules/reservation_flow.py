@@ -129,6 +129,15 @@ def claim_pending(reservation: dict) -> bool:
                 (reservation.get("guest_name"), checkin_iso, checkout_iso, booking_id),
             )
             conn.execute("COMMIT")
+            # 재예약(취소→재확정): 같은 booking_id의 영구 dedup 키가 남아 있으면
+            # finalize의 예약 알림이 스킵된다. 키를 비워 재알림이 나가도록 한다.
+            # (created/deleted + 차단/해제 완료 검증 알림 모두 재발송 가능하게)
+            notifier.clear_dedup_keys([
+                f"reservation:{platform}:{booking_id}:created",
+                f"reservation:{platform}:{booking_id}:deleted",
+                f"airbnb_block_confirmed:{booking_id}",
+                f"airbnb_unblock_confirmed:{booking_id}",
+            ])
             logger.info("[Flow] 취소건 재예약 되살림: %s/%s (체크인 %s)",
                         platform, booking_id, checkin_iso)
             return True
@@ -378,6 +387,53 @@ def confirm_airbnb_blocks() -> int:
         co = _to_date(r["checkout"])
         if ci and co and _range_covered(ci, co, ranges):
             notifier.send_airbnb_block_confirmed({
+                "platform": "naver",
+                "booking_id": r["booking_id"],
+                "guest_name": r["guest_name"],
+                "guests": r["guests"],
+                "checkin": ci,
+                "checkout": co,
+            })
+            sent += 1
+    return sent
+
+
+def confirm_airbnb_unblocks() -> int:
+    """취소된 네이버 예약 중, 에어비앤비가 차단 해제를 실제로 반영(export iCal에서
+    해당 구간의 'Not available'가 사라짐)한 건에 '🔓 차단 해제 완료' 알림을 1회 발송.
+
+    같은 날짜에 아직 활성 예약이 있어 차단이 유지되면(구간이 여전히 covered) 발송하지
+    않는다. 반환: 발송 건수.
+    """
+    today = date.today()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT booking_id, guest_name, guests, checkin, checkout FROM reservations "
+            "WHERE platform = 'naver' AND status = 'cancelled' AND checkout >= ?",
+            (today.isoformat(),),
+        ).fetchall()
+    if not rows:
+        return 0
+
+    # 아직 해제완료 알림을 안 보낸 건만 (notify_state 영구 dedup 기준).
+    pending = [
+        r for r in rows
+        if notifier._should_send(f"airbnb_unblock_confirmed:{r['booking_id']}", None)
+    ]
+    if not pending:
+        return 0
+
+    ranges = _airbnb_blocked_ranges()
+    if ranges is None:  # iCal 못 읽음 → 이번 사이클 판단 보류 (오탐 방지)
+        return 0
+
+    sent = 0
+    for r in pending:
+        ci = _to_date(r["checkin"])
+        co = _to_date(r["checkout"])
+        # 차단 구간에서 빠졌으면(= 더 이상 막혀있지 않으면) 해제가 실제 반영된 것.
+        if ci and co and not _range_covered(ci, co, ranges):
+            notifier.send_airbnb_unblock_confirmed({
                 "platform": "naver",
                 "booking_id": r["booking_id"],
                 "guest_name": r["guest_name"],

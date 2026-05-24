@@ -1015,6 +1015,12 @@ def run_pipeline() -> int:
         except Exception:
             logger.exception("에어비앤비 차단 확인 중 예외")
 
+        # 에어비앤비가 차단 해제를 실제 반영(iCal에서 'Not available' 사라짐)했는지 확인 → 해제완료 알림
+        try:
+            reservation_flow.confirm_airbnb_unblocks()
+        except Exception:
+            logger.exception("에어비앤비 차단 해제 확인 중 예외")
+
         # 에어비앤비 예약 변경 처리
         try:
             stat_modify = _handle_airbnb_modifications()

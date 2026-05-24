@@ -120,6 +120,22 @@ def _mark_sent(dedup_key: str) -> None:
     _save_notify_state(state)
 
 
+def clear_dedup_keys(keys: list[str]) -> int:
+    """주어진 dedup 키들을 notify_state에서 제거. 재예약(취소→재확정) 시
+    같은 booking_id의 영구 키가 남아 알림이 스킵되는 것을 막기 위해 호출한다.
+    반환: 실제 삭제된 키 수.
+    """
+    state = _load_notify_state()
+    removed = 0
+    for k in keys:
+        if k in state:
+            del state[k]
+            removed += 1
+    if removed:
+        _save_notify_state(state)
+    return removed
+
+
 # =============================================================
 # 메시지 생성
 # =============================================================
@@ -154,8 +170,11 @@ def _build_message(reservation: dict, action: str) -> Optional[str]:
     _BLOCK_LINE = {
         "airbnb": "\n⚠️ 네이버 플레이스 수동 차단 필요",
     }
+    # 네이버 취소의 '🔓 에어비앤비 차단 해제 완료'도 실제 반영(에어비앤비 export iCal에서
+    # 'Not available'가 사라짐) 시점에 confirm_airbnb_unblocks → send_airbnb_unblock_confirmed
+    # 로 별도 발송한다. 생성 시 '차단 완료'를 즉시 말 못 하는 것과 같은 이유(에어비앤비는
+    # 우리 iCal을 시간당 1회 가져가므로 취소 즉시 '해제 완료'라고 말할 수 없다).
     _UNBLOCK_LINE = {
-        "naver": "\n🔓 에어비앤비 해당 날짜 차단 해제 완료",
         "airbnb": "\n🔓 네이버 플레이스 수동 해제 필요",
     }
 
@@ -254,6 +273,28 @@ def send_airbnb_block_confirmed(reservation: dict) -> None:
         logger.info("[Notify] 에어비앤비 차단 완료 알림 OK: %s", booking_id)
     else:
         logger.warning("[Notify] 에어비앤비 차단 완료 알림 미발송: %s", booking_id)
+
+
+def send_airbnb_unblock_confirmed(reservation: dict) -> None:
+    """에어비앤비가 우리 차단 해제(blocked.ics에서 제거)를 실제로 반영했을 때 발송.
+
+    confirm_airbnb_unblocks()가 에어비앤비 export iCal에서 해당 구간의 'Not available'가
+    사라진 것을 확인한 뒤 호출한다. booking_id당 영구 1회(전송 성공 시에만 기록).
+    """
+    booking_id = reservation.get("booking_id", "")
+    name = reservation.get("guest_name") or "예약자"
+    checkin = _format_date(reservation.get("checkin"))
+    checkout = _format_date(reservation.get("checkout"))
+    message = (
+        "🔓 에어비앤비 해당 날짜 차단 해제 완료\n"
+        f"예약자: {name}\n"
+        f"📅 {checkin}~{checkout}"
+    )
+    dedup_key = f"airbnb_unblock_confirmed:{booking_id}" if booking_id else None
+    if _send_message(message, dedup_key=dedup_key):
+        logger.info("[Notify] 에어비앤비 차단 해제 완료 알림 OK: %s", booking_id)
+    else:
+        logger.warning("[Notify] 에어비앤비 차단 해제 완료 알림 미발송: %s", booking_id)
 
 
 def send_guests_update(guest_name: str, old_guests: int, new_guests: int) -> None:
