@@ -79,7 +79,17 @@
       "Bash(tasklist)",
       "Bash(wmic process *)",
       "Bash(grep -v \"^$\")",
-      "PowerShell(Get-CimInstance *)"
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-ChildItem *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(PYTHONIOENCODING=utf-8 python *)",
+      "WebFetch(domain:burnhaam.github.io)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python -c \"import sqlite3; c=sqlite3.connect\\('db/reservations.db'\\); c.row_factory=sqlite3.Row; rows=c.execute\\(\\\\\"SELECT booking_id, guest_name, checkin, status, samhaengsi_sent FROM reservations WHERE checkin='2026-05-15'\\\\\"\\).fetchall\\(\\); [print\\(dict\\(r\\)\\) for r in rows]\")",
+      "PowerShell(python scripts/_check_0515.py)",
+      "PowerShell($env:FORCE_SAMHAENGSI=\"1\"; python -c \"from main import _send_checkin_day_samhaengsi; n = _send_checkin_day_samhaengsi\\(\\); print\\('SENT_COUNT=' + str\\(n\\)\\)\")",
+      "PowerShell(python -c \"import sqlite3; conn=sqlite3.connect\\('data/reservations.db'\\); cur=conn.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table'\\\\\"\\); print\\([r[0] for r in cur.fetchall\\(\\)]\\)\")",
+      "PowerShell(Test-Path *)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

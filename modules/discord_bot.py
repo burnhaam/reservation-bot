@@ -2,7 +2,7 @@
 Discord 봇 — 버튼 기반 승인 + 슬래시 커맨드 백업 인터페이스.
 
 역할:
-- 카카오 알림 이중화는 notifier.py의 `_send_discord_webhook()`이 이미 처리.
+- 알림 채널은 notifier.py의 `_send_discord_webhook()`이 처리.
 - 매핑 승인은 봇이 채널에 발송한 메시지의 [✅ 매핑 승인] / [❌ 매핑 거절]
   버튼으로 처리 (송금 자동화 봇과 동일 패턴, custom_id 영구 View).
 - 슬래시 커맨드는 봇 다운/장애 시 백업 경로로 유지.

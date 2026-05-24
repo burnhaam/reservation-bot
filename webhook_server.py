@@ -2,7 +2,7 @@
 MacroDroid 웹훅 수신 서버.
 
 네이버 앱 알림 + 에어비앤비 문자를 웹훅으로 수신하고,
-캘린더 등록, 카카오 알림, blocked.ics, DB 저장 파이프라인을 실행한다.
+캘린더 등록, Discord 알림, blocked.ics, DB 저장 파이프라인을 실행한다.
 
 사용법:
   python webhook_server.py
@@ -148,139 +148,26 @@ def _generate_booking_id(platform: str, guest_name: str, checkin: date) -> str:
 # 파이프라인 — 신규
 # =============================================================
 
-def _try_update_guest_name(reservation: dict) -> Optional[dict]:
-    """동일 날짜의 기존 예약 중 guest_name이 '?'인 건을 업데이트."""
-    guest_name = reservation.get("guest_name", "")
-    checkin = reservation["checkin"].isoformat()
-    platform = reservation["platform"]
-
-    if not guest_name or guest_name == "?":
-        return None
-
-    with get_connection() as conn:
-        cur = conn.execute(
-            "SELECT booking_id, google_event_id_a, google_event_id_b "
-            "FROM reservations "
-            "WHERE platform = ? AND checkin = ? AND status = 'confirmed' "
-            "  AND (guest_name IS NULL OR guest_name IN ('?', '', '확인필요'))",
-            (platform, checkin),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        return None
-
-    actual_id = row["booking_id"]
-    config = load_config()
-    prefix = config.get("platform_prefix", {}).get(platform, "")
-    owner_cal = config.get("naver_owner_calendar", "")
-    staff_cal = config.get("naver_staff_calendar", "")
-
-    with get_connection() as conn:
-        cur2 = conn.execute(
-            "SELECT guests FROM reservations WHERE booking_id = ?", (actual_id,)
-        )
-        guests = cur2.fetchone()["guests"] or config.get("base_guests", 2)
-
-    summary_a = f"{prefix}. {guest_name}. {guests}인"
-    summary_b = f"{config.get('staff_name', '')} / {guests}인"
-
-    calendar.update_event_summary(row["google_event_id_a"], owner_cal, summary_a)
-    calendar.update_event_summary(row["google_event_id_b"], staff_cal, summary_b)
-
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE reservations SET guest_name = ? WHERE booking_id = ?",
-            (guest_name, actual_id),
-        )
-        conn.commit()
-
-    logger.info("[Webhook] 이름 업데이트: %s → %s", actual_id, guest_name)
-    return {"status": "ok", "action": "name_updated", "booking_id": actual_id, "guest_name": guest_name}
-
-
 def _handle_new_reservation(reservation: dict) -> dict:
+    """신규 예약: pending_email 로 claim 후 Gmail 정보와 합쳐 확정(merge-before-create).
+
+    트리거(웹훅)만으로는 캘린더/알림을 만들지 않는다. claim 직후 즉시 Gmail 확인을
+    시도하고(보통 메일이 이미 도착해 즉시 확정), 아직이면 pending 상태로 두어
+    webhook_server 워처(1분)와 main.py 파이프라인(5분)이 재시도한다.
+
+    네이버=웹훅(이름)+Gmail(인원), 에어비앤비=웹훅(날짜)+Gmail(이름·인원).
+    """
+    from modules import reservation_flow
+
     booking_id = reservation["booking_id"]
     platform = reservation["platform"]
-    checkin_str = reservation["checkin"].isoformat()
 
-    # 동일 날짜에 이름이 없는 기존 예약이 있으면 이름만 업데이트
-    name_update = _try_update_guest_name(reservation)
-    if name_update:
-        return name_update
+    if not reservation_flow.claim_pending(reservation):
+        return {"status": "skip", "reason": "duplicate_or_exists", "booking_id": booking_id}
 
-    # 동일 booking_id 중복 체크
-    with get_connection() as conn:
-        cur = conn.execute(
-            "SELECT id FROM reservations WHERE booking_id = ?", (booking_id,)
-        )
-        if cur.fetchone():
-            return {"status": "skip", "reason": "already_processed", "booking_id": booking_id}
-
-    # 에어비앤비: 같은 체크인 날짜에 이미 Gmail로 처리된 예약이 있으면 skip
-    if platform == "airbnb":
-        with get_connection() as conn:
-            cur = conn.execute(
-                "SELECT id FROM reservations "
-                "WHERE platform = 'airbnb' AND checkin = ? AND status = 'confirmed'",
-                (checkin_str,),
-            )
-            if cur.fetchone():
-                return {"status": "skip", "reason": "already_processed_by_gmail", "checkin": checkin_str}
-
-        # Gmail로 아직 처리 안 됨 → 임시 저장 (캘린더 미생성)
-        with get_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO reservations
-                    (platform, booking_id, guest_name, guests,
-                     checkin, checkout, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
-                """,
-                (
-                    platform,
-                    booking_id,
-                    "확인필요",
-                    reservation.get("guests"),
-                    checkin_str,
-                    reservation["checkout"].isoformat(),
-                ),
-            )
-            conn.commit()
-
-        logger.info("[Webhook] 에어비앤비 임시 저장: %s (Gmail 대기)", booking_id)
-        return {"status": "ok", "action": "pending_gmail", "booking_id": booking_id}
-
-    # 네이버: 즉시 전체 처리
-    cal_ids = calendar.create_events(reservation)
-
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO reservations
-                (platform, booking_id, guest_name, guests,
-                 checkin, checkout, status,
-                 google_event_id_a, google_event_id_b)
-            VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)
-            """,
-            (
-                platform,
-                booking_id,
-                reservation.get("guest_name"),
-                reservation.get("guests"),
-                checkin_str,
-                reservation["checkout"].isoformat(),
-                cal_ids.get("google_a"),
-                cal_ids.get("google_b"),
-            ),
-        )
-        conn.commit()
-
-    blocker.block_airbnb(reservation)
-    notifier.send_notification(reservation, "created")
-
-    logger.info("[Webhook] 신규 예약 처리 완료: %s/%s", platform, booking_id)
-    return {"status": "ok", "action": "created", "booking_id": booking_id}
+    status = reservation_flow.finalize_if_ready(booking_id)
+    logger.info("[Webhook] 신규 claim: %s/%s → %s", platform, booking_id, status)
+    return {"status": "ok", "action": status, "booking_id": booking_id}
 
 
 # =============================================================
@@ -367,12 +254,17 @@ def webhook():
             else:
                 platform = "naver"
 
+        # 에어비앤비는 iCal+Gmail 파이프라인(main.py)이 트리거·날짜·이름·인원·취소까지
+        # 전부 처리한다(DB 14건 중 13건이 iCal산, 웹훅산 1건은 중복 유령 예약이었음).
+        # 웹훅 SMS는 잉여이며 '취소-후 늦은 SMS'로 유령 예약을 만들어 중복 알림을
+        # 유발하므로 무시한다. 네이버는 iCal이 없어 웹훅이 주 경로이므로 그대로 처리.
         if platform == "airbnb":
-            parsed = _parse_airbnb_body(body)
-            is_cancel = parsed.get("is_cancel", False) or "취소" in title
-        else:
-            parsed = _parse_naver_body(body)
-            is_cancel = "예약취소" in title or "취소" in title
+            logger.info("[Webhook] 에어비앤비 웹훅 무시 (iCal+Gmail 파이프라인이 처리): title=%s", title)
+            return jsonify({"status": "ignored", "reason": "airbnb_handled_by_ical"}), 200
+
+        # 여기 도달하는 건 네이버뿐 (에어비앤비는 위에서 early-return).
+        parsed = _parse_naver_body(body)
+        is_cancel = "예약취소" in title or "취소" in title
 
         if not parsed.get("guest_name") or not parsed.get("checkin"):
             logger.warning("[Webhook] 파싱 실패: platform=%s, parsed=%s", platform, parsed)
@@ -425,11 +317,41 @@ def handle_exception(e):
 
 
 # =============================================================
+# pending_email 빠른 재시도 워처 (0~5분, 1분 간격)
+# =============================================================
+
+def _pending_watcher_loop() -> None:
+    """60초마다 생성 5분 이내 pending_email 예약을 finalize 재시도.
+
+    main.py 파이프라인은 5분 주기라 sub-5분 granularity가 불가능하므로, 항상 떠 있는
+    이 서버가 0~5분 구간의 1분 단위 재시도를 담당한다(웹훅·iCal 트리거 공통).
+    5~60분 구간과 60분 만료 강제확정은 파이프라인이 처리한다.
+    """
+    import time
+    from modules import reservation_flow
+
+    while True:
+        try:
+            time.sleep(60)
+            n = reservation_flow.retry_pending(
+                max_age_minutes=reservation_flow.FAST_WINDOW_MINUTES
+            )
+            if n:
+                logger.info("[Watcher] pending 확정 %d건", n)
+        except Exception:
+            logger.exception("[Watcher] pending 워처 예외 (계속)")
+
+
+# =============================================================
 # 메인 실행 (자동 재시작)
 # =============================================================
 
 if __name__ == "__main__":
     import time
+    import threading
+
+    threading.Thread(target=_pending_watcher_loop, daemon=True).start()
+    logger.info("[Webhook] pending 워처 시작 (60초 주기, 0~5분 창)")
 
     while True:
         try:

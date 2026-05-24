@@ -26,6 +26,7 @@ data/coupang_cookies_export.json
 data/*.local.json
 
 # 알림 디듀프 / 런타임 상태 (로컬 전용)
+data/naver_backup_state.json
 data/notify_state.json
 data/parser_failure_state.json
 data/pending_approvals.json

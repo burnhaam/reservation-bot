@@ -79,7 +79,7 @@ def main():
         print(f"      결과: {'OK' if valid else 'FAIL (로그인 필요)'} ({time.time() - t0:.1f}s)")
         print(f"      현재 URL: {page.url}\n")
         if not valid:
-            print("[중단] 세션 무효 — data/coupang_session.json 재갱신 필요")
+            print("[중단] 세션 무효 - data/coupang_session.json 재갱신 필요")
             return
 
         print("[3/6] 상품 상세 페이지 접속...")
@@ -108,6 +108,13 @@ def main():
         print()
 
         print("[6/6] 장바구니 버튼 셀렉터 점검 (클릭 안 함)...")
+        # production add_single_item은 _delay(2~5s) + Akamai 대기를 거치므로 hydration 끝난 후 검사.
+        # dryrun도 동일 조건을 맞춘다 (networkidle 대기 + 안전 마진).
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        time.sleep(2)
         # _click_add_to_cart의 셀렉터들이 현재 페이지에서 정상 발견되는지 확인
         button_selectors = [
             "button.prod-cart-btn",
@@ -142,7 +149,7 @@ def main():
         ok = valid and not bot and not sold_out and price is not None and button_found
         print("=" * 60)
         if ok:
-            print(" [PASS] 드라이런 통과 — 자동화 실행 준비 완료")
+            print(" [PASS] 드라이런 통과 - 자동화 실행 준비 완료")
         else:
             reasons = []
             if not valid: reasons.append("세션무효")
@@ -150,7 +157,7 @@ def main():
             if sold_out: reasons.append("품절")
             if price is None: reasons.append("가격추출실패")
             if not button_found: reasons.append("카트버튼없음")
-            print(f" [WARN] 드라이런 부분통과 — {', '.join(reasons)}")
+            print(f" [WARN] 드라이런 부분통과 - {', '.join(reasons)}")
         print("=" * 60)
     finally:
         close_browser(p, browser, context, page)

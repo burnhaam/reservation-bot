@@ -2,7 +2,7 @@
 프로세스 감시 스크립트.
 
 webhook_server.py(5000), serve_ical.py(8080)가 응답하는지 확인하고
-꺼져있으면 자동 재시작 + 카카오톡 알림.
+꺼져있으면 자동 재시작 + Discord 알림.
 
 사용법:
   python watchdog.py          # 1회 점검
@@ -83,13 +83,13 @@ def _start_process(script: str) -> bool:
         return False
 
 
-def _send_kakao_alert(message: str) -> None:
+def _send_discord_alert(message: str) -> None:
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
-        from modules.notifier import _send_kakao_message
-        _send_kakao_message(message)
+        from modules.notifier import _send_message
+        _send_message(message)
     except Exception as e:
-        logger.error("[Watchdog] 카카오 알림 실패: %s", e)
+        logger.error("[Watchdog] Discord 알림 실패: %s", e)
 
 
 # =============================================================
@@ -166,7 +166,7 @@ def main():
                 logger.error("[Watchdog] %s 재시작 후에도 응답 없음", name)
 
         if fail_counts[name] == ALERT_THRESHOLD:
-            _send_kakao_alert(f"[서버 장애] {name} 24시간 이상 복구 불가, 수동 확인 필요")
+            _send_discord_alert(f"[서버 장애] {name} 24시간 이상 복구 불가, 수동 확인 필요")
 
     _save_fail_counts(fail_counts)
 

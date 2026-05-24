@@ -251,6 +251,11 @@ def detect_airbnb() -> list[dict]:
 
     known = _get_known_reservations("airbnb")
     current_ids = {e["booking_id"] for e in current_events}
+    # iCal에 현재 존재하는 체크인 날짜 집합. 웹훅으로 들어온 예약은 booking_id가
+    # iCal UID가 아닌 해시라 current_ids에 없을 수 있으므로, 체크인 날짜로도 활성 판단.
+    current_checkins = {
+        e["checkin"].isoformat() for e in current_events if e.get("checkin")
+    }
     today = date.today()
 
     results: list[dict] = []
@@ -273,21 +278,19 @@ def detect_airbnb() -> list[dict]:
         if checkin_str in known_by_checkin:
             continue
 
+        # 이름/인원 보강(Gmail)은 finalize 단계에서 수행 — 여기선 트리거만 만든다.
         guest_name = event.get("guest_name")
         if not guest_name or guest_name == "Reserved":
-            gmail_info = _extract_airbnb_info_from_gmail(event.get("checkin"))
-            if gmail_info:
-                event["guest_name"] = gmail_info.get("guest_name", "(예약됨)")
-                if gmail_info.get("guests") is not None:
-                    event["guests"] = gmail_info["guests"]
-            else:
-                event["guest_name"] = "(예약됨)"
+            event["guest_name"] = "(예약됨)"
         results.append({"platform": "airbnb", "action": "new", **event})
 
     # 취소: DB에 있지만 iCal에서 사라짐 (이미 취소 처리된 건 제외)
     cancel_candidates: list[dict] = []
     for booking_id, row in known.items():
         if booking_id in current_ids:
+            continue
+        # 같은 체크인이 아직 iCal에 있으면 활성 (웹훅 해시 booking_id 등) — 취소 후보 제외
+        if row.get("checkin") in current_checkins:
             continue
         if row.get("status") == "cancelled":
             continue
@@ -379,6 +382,11 @@ def _airbnb_cancel_email_checkins(window_days: int = 7) -> set[date]:
 
 _NAVER_GMAIL_QUERY = (
     'newer_than:1d '
+    '(from:noreply@naver.com OR from:naverbooking_noreply@navercorp.com OR subject:"네이버 예약")'
+)
+# 하루 1회 백업 스윕용 — 누락 복구를 위해 조회 창을 2일로 넓힌다.
+_NAVER_GMAIL_QUERY_BACKUP = (
+    'newer_than:2d '
     '(from:noreply@naver.com OR from:naverbooking_noreply@navercorp.com OR subject:"네이버 예약")'
 )
 
@@ -495,8 +503,12 @@ def _parse_naver_email(msg: dict) -> Optional[dict]:
     }
 
 
-def detect_naver() -> list[dict]:
-    """네이버 플레이스 신규/취소 예약 감지 (Gmail 파싱)."""
+def detect_naver(query: Optional[str] = None) -> list[dict]:
+    """네이버 플레이스 신규/취소 예약 감지 (Gmail 파싱).
+
+    query 미지정 시 기본 1일 창. 하루 1회 백업 스윕은 _NAVER_GMAIL_QUERY_BACKUP(2일)
+    를 넘겨 웹훅 누락분을 더 넓게 복구한다.
+    """
     try:
         service = _get_gmail_service()
     except FileNotFoundError:
@@ -508,7 +520,7 @@ def detect_naver() -> list[dict]:
 
     try:
         list_resp = service.users().messages().list(
-            userId="me", q=_NAVER_GMAIL_QUERY
+            userId="me", q=query or _NAVER_GMAIL_QUERY
         ).execute()
         message_refs = list_resp.get("messages", [])
     except Exception as e:
@@ -568,6 +580,53 @@ def detect_naver() -> list[dict]:
             continue
 
     return results
+
+
+def collect_naver_email_data() -> dict[str, dict]:
+    """최근 네이버 예약 메일을 파싱해 체크인 날짜(ISO) → 정보 dict 매핑 반환.
+
+    detect_naver()와 달리 DB 중복 체크 없이 'new' 액션 메일을 모두 반환한다.
+    웹훅으로 먼저 들어와 base_guests로 박힌 예약을 메일 정보로 보정할 때 사용.
+    """
+    try:
+        service = _get_gmail_service()
+    except FileNotFoundError:
+        logger.warning("[Naver] token.json이 없어 Gmail 조회를 건너뜀")
+        return {}
+    except Exception as e:
+        logger.error("[Naver] Gmail 서비스 초기화 실패: %s", e)
+        return {}
+
+    try:
+        list_resp = service.users().messages().list(
+            userId="me", q=_NAVER_GMAIL_QUERY
+        ).execute()
+        message_refs = list_resp.get("messages", [])
+    except Exception as e:
+        logger.error("[Naver] Gmail 메일 목록 조회 실패: %s", e)
+        return {}
+
+    # Gmail list는 최신순. 같은 체크인 메일이 여럿이면 가장 최신 1통만 유지.
+    by_checkin: dict[str, dict] = {}
+    for ref in message_refs:
+        try:
+            msg = service.users().messages().get(
+                userId="me", id=ref["id"], format="full"
+            ).execute()
+        except Exception as e:
+            logger.error("[Naver] Gmail 메일 상세 조회 실패 (id=%s): %s", ref["id"], e)
+            continue
+        parsed = _parse_naver_email(msg)
+        if not parsed or parsed.get("action") != "new":
+            continue
+        ci = parsed.get("checkin")
+        if not ci:
+            continue
+        ci_str = ci.isoformat()
+        if ci_str not in by_checkin:
+            by_checkin[ci_str] = parsed
+
+    return by_checkin
 
 
 # =============================================================

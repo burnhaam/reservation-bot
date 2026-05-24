@@ -3,7 +3,7 @@
 > **버전**: v2.0 (실구현은 v2.1로 진화 — 아래 "변경 이력" 참조)
 > **작성일**: 2026-04-20  
 > **최종 반영**: 2026-04-23
-> **변경**: 사장님 승인 단계 제거 → 자동 차단 + 카카오 결과 알림 방식  
+> **변경**: 사장님 승인 단계 제거 → 자동 차단 + Discord 결과 알림 방식  
 > **기반 레포**: `burnhaam/reservation-bot` (기존 모듈 70% 재활용)  
 > **개발 기간 추정**: 약 3일 (코딩 1.5~2일 + 셋업/테스트 1일)
 
@@ -31,7 +31,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 - **중간 시도**: patchright (Playwright fork) → blob worker CSP 차단으로 로그인 실패
 - **최종 채택**: **사용자 실제 Chrome을 `--remote-debugging-port=9222`로 띄우고 CDP attach**. 별도 프로필 (`%USERPROFILE%\chrome_cdp_profile`).
 - **쿠키 주입 경로**: DevTools에서 쿠키 JSON export → `scripts/coupang_convert_cookies.py`로 Playwright storage_state 형식 변환 → `data/coupang_session.json` 저장 → `init_browser()`에서 로드
-- **안전망**: CDP 포트 미응답 시 자동주문 스킵 + 카카오 "수동주문 필요" 알림 (영구 1회)
+- **안전망**: CDP 포트 미응답 시 자동주문 스킵 + Discord "수동주문 필요" 알림 (영구 1회)
 - **관련 스크립트**:
   - `scripts/coupang_chrome_cdp_start.py` — CDP 모드 Chrome 런처
   - `scripts/coupang_convert_cookies.py` — DevTools 쿠키 → storage_state 변환
@@ -44,7 +44,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 - **현재**: 매 폴링(5분)마다 실행. `stock_detector`가 `(event_id, memo_hash)` 기준으로 이미 처리된 메모를 걸러내므로 변경 없으면 1~2초 내 early-return
 - **효과**: 메모 작성 후 **최대 5분 내** 카트에 담김 (이전 최대 24시간)
 
-### 0.5 카카오 알림 — 모든 알림 영구 1회
+### 0.5 Discord 알림 — 모든 알림 영구 1회
 - 총 15종 알림 모두 `dedup_key` + `cooldown_hours=None`으로 영구 1회 발송
 - 재발송 필요 시 `data/notify_state.json` 에서 해당 키 수동 제거
 - **신규 알림 2종**:
@@ -63,12 +63,12 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 ## 1. 개요
 
 ### 1.1 목적
-숙박업 운영 중 발생하는 소모품 재고 관리를 자동화한다. 알바생이 청소 후 구글 캘린더에 재고 부족을 메모하면, 시스템이 자동으로 쿠팡 장바구니에 해당 상품을 담아두고 카카오톡으로 결과를 알린다. 사장님은 알림 받고 쿠팡 앱에서 결제만 클릭한다.
+숙박업 운영 중 발생하는 소모품 재고 관리를 자동화한다. 알바생이 청소 후 구글 캘린더에 재고 부족을 메모하면, 시스템이 자동으로 쿠팡 장바구니에 해당 상품을 담아두고 Discord으로 결과를 알린다. 사장님은 알림 받고 쿠팡 앱에서 결제만 클릭한다.
 
 ### 1.2 배경
-- 알바생이 카카오톡으로 재고 부족을 보고 → 사장님이 매번 수동으로 쿠팡에서 검색·주문 → 시간 소모 큼
+- 알바생이 Discord으로 재고 부족을 보고 → 사장님이 매번 수동으로 쿠팡에서 검색·주문 → 시간 소모 큼
 - 기존 `reservation-bot` 레포에 예약 자동화 인프라가 이미 구축되어 있음
-- 같은 인프라(설정, DB, 카카오 알림, 로깅, 스케줄러)를 재활용하여 빠르게 확장 가능
+- 같은 인프라(설정, DB, Discord 알림, 로깅, 스케줄러)를 재활용하여 빠르게 확장 가능
 
 ### 1.3 v2 핵심 설계 원칙
 **"사장님 승인 단계를 자동 차단 로직으로 대체"**
@@ -95,7 +95,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 4. 매핑표(`product_mapping.json`)에서 쿠팡 URL 조회
 5. 매핑 없는 품목은 쿠팡 주문내역에서 검색하여 가장 최근 주문 자동 선택
 6. 자동 안전장치 통과 시 → Playwright로 쿠팡 장바구니 자동 담기
-7. 카카오톡으로 결과 알림 (성공/스킵/실패 + 총액)
+7. Discord으로 결과 알림 (성공/스킵/실패 + 총액)
 8. 사장님이 쿠팡 앱에서 결제 1번 클릭
 
 ### 2.2 자동 차단(스킵) 케이스
@@ -142,7 +142,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 - **2순위**: 쿠팡 주문내역(`마이쿠팡 > 주문목록`)에서 품목명으로 검색
   - 가장 최근 주문 자동 선택 (180일 이내)
   - 매칭 결과 가격을 매핑표 부재 시 임시 `최대가격` 기준으로 사용 (1.5배 룰)
-- **3순위**: 매칭 실패 → 스킵 + 카카오 알림에 별도 표시
+- **3순위**: 매칭 실패 → 스킵 + Discord 알림에 별도 표시
 - **매핑표 형식**:
   ```json
   {
@@ -172,7 +172,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 ### 3.6 하루 주문 한도 (FR-6)
 - 하루 최대 5회 주문 (config: `max_daily_orders`)
 - 한도 초과 시 다음 사이클로 이연 (스킵 아님, 다음 1시간 후 재시도)
-- 한도 도달 시 카카오 알림: "오늘 주문 한도 도달, 내일 처리 예정"
+- 한도 도달 시 Discord 알림: "오늘 주문 한도 도달, 내일 처리 예정"
 
 ### 3.7 쿠팡 장바구니 담기 (FR-7)
 - **도구**: Playwright (Chromium) + `playwright-stealth`
@@ -184,7 +184,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 - **Anti-bot 감지** (캡차/SMS 페이지 selector 발견) → 즉시 중단
 
 ### 3.8 결과 알림 (FR-8)
-- 모든 처리 완료 후 카카오톡 1건의 메시지 발송
+- 모든 처리 완료 후 Discord 1건의 메시지 발송
 - 메시지 형식:
   ```
   [재고 자동주문 완료]
@@ -231,7 +231,7 @@ PRD v2에서 "Playwright로 쿠팡 조작" 단순 명시된 부분이 실제로�
 ### 4.3 보안
 - `.env` 파일에만 자격증명 저장 (gitignore)
 - `data/coupang_session.json` gitignore
-- 카카오 토큰은 자동 갱신, `.env`에 재저장 (기존 패턴)
+- Discord 토큰은 자동 갱신, `.env`에 재저장 (기존 패턴)
 - Anthropic API 키도 .env에 저장
 
 ### 4.4 운영
@@ -301,7 +301,7 @@ def run_stock_pipeline():
     3. apply_skip_filters()            # 중복 + 한도 체크 → 스킵 분류
     4. match_products()                # 매핑표 + 주문내역 매칭 → 매핑 실패 분류
     5. validate_prices_and_order()     # 가격 검증 + Playwright 장바구니 담기
-    6. send_result_notification()      # 카카오 결과 알림
+    6. send_result_notification()      # Discord 결과 알림
 ```
 
 ### 5.3 DB 스키마 (추가)
@@ -464,11 +464,11 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### 6.6 `modules/notifier.py` 추가 함수
 - `send_stock_result(result: dict)`
   - 입력: `{"success": [], "skipped": [], "unmapped": [], "failed": []}`
-  - 메시지 포맷팅 후 기존 `_send_kakao_message()` 호출
+  - 메시지 포맷팅 후 기존 `_send_message()` 호출
   - 처리 항목 0건이면 발송 안 함
 - `send_stock_alert(message: str)`
   - SMS/세션 만료 등 즉시 알림용
-  - 기존 `_send_kakao_message()` 직접 호출
+  - 기존 `_send_message()` 직접 호출
 
 ### 6.7 `main.py` 추가 함수
 - `run_stock_pipeline() -> int`
@@ -493,7 +493,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 4. 별칭(알바생이 다르게 부를 수 있는 표현) 추가
 
 ### 7.2 운영 중 추가
-- 매핑 안 된 품목은 카카오톡 알림으로 안내됨
+- 매핑 안 된 품목은 Discord 알림으로 안내됨
 - 사장님이 그때그때 매핑표에 추가
 - 매핑표는 GitHub에서 직접 편집 가능 (push 시 자동 반영)
 
@@ -528,11 +528,11 @@ ANTHROPIC_API_KEY=sk-ant-...
 | 쿠팡 봇 탐지 강화 | 100% 보장 X | 높음 | 랜덤 딜레이, headless OFF |
 | SMS 인증 발생 가능 | 사람 개입 필요 | 중간 | 즉시 중단 + 알림 |
 | 쿠팡 HTML 변경 | selector 깨짐 | 중간 | 분기별 점검 |
-| 카카오 단방향 API | 사장님 답장 못 받음 | **해소** | v2에서 승인 단계 제거 |
+| Discord 단방향 API | 사장님 답장 못 받음 | **해소** | v2에서 승인 단계 제거 |
 
 ### 8.2 운영 제약
 - PC 24시간 켜두기 필수 (또는 미니PC)
-- 카카오 토큰 만료 시 사장님 재인증 필요
+- Discord 토큰 만료 시 사장님 재인증 필요
 - 매핑표 누적 관리 책임은 사장님
 
 ### 8.3 법적 회색지대
@@ -594,7 +594,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### 10.3 운영 검수
 - [ ] 1주일 무중단 가동
 - [ ] 로그 정상 기록 (logs/YYYY-MM-DD.log)
-- [ ] 카카오 알림 정상 수신
+- [ ] Discord 알림 정상 수신
 - [ ] cron/Task Scheduler 정상 트리거
 - [ ] 메모리 누수 없음 (1주일 후 메모리 사용량 안정)
 

@@ -1,4 +1,4 @@
-# HTTP 요청 (네이버/카카오 API 호출용)
+# HTTP 요청 (네이버/Discord 웹훅 API 호출용)
 requests>=2.31.0
 
 # 환경변수 로드 (.env)
@@ -37,5 +37,5 @@ patchright>=1.0.0
 # storage_state로 변환 (Akamai 봇 챌린지 우회용 — 로그인 자동화 회피 경로)
 browser_cookie3>=0.19.1
 
-# Discord 봇 (카카오 알림 이중화 + 슬래시 커맨드 기반 승인)
+# Discord 봇 (알림 + 슬래시 커맨드 기반 승인)
 discord.py>=2.3.0

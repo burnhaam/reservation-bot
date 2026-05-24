@@ -18,10 +18,6 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 # 이 모듈이 참조하는 환경변수 키 목록
 ENV_KEYS = [
     "AIRBNB_ICAL_URL",
-    "KAKAO_REST_API_KEY",
-    "KAKAO_CLIENT_SECRET",
-    "KAKAO_ACCESS_TOKEN",
-    "KAKAO_REFRESH_TOKEN",
     "NAVER_PLACE_ID",
     "GITHUB_TOKEN",
     "GEMINI_API_KEY",

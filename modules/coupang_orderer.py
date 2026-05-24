@@ -134,7 +134,7 @@ def _apply_stealth(page) -> None:
 
     - playwright-stealth 2.x: Stealth().apply_stealth_sync(page)
     - playwright-stealth 1.x: stealth_sync(page) (deprecated)
-    둘 다 실패하면 사장님에게 카카오 경고를 보내되 파이프라인은 계속 진행.
+    둘 다 실패하면 사장님에게 Discord 경고를 보내되 파이프라인은 계속 진행.
     """
     # v2.x API (권장)
     try:
@@ -237,6 +237,12 @@ def _try_cdp_attach(p):
     else:
         context = contexts[0]
     page = context.new_page()
+    # CDP attach 시 실제 Chrome 창 크기에 의존하면 모바일 레이아웃으로 떨어질 수 있음
+    # (창이 작게 복원/최소화된 상태). 페이지 emulated viewport를 강제로 PC 크기로 고정.
+    try:
+        page.set_viewport_size({"width": 1280, "height": 800})
+    except Exception:
+        logger.warning("[Coupang] CDP page viewport 설정 실패 (계속 진행)", exc_info=True)
     return browser, context, page
 
 
@@ -516,25 +522,118 @@ def _extract_current_price(page) -> Optional[int]:
     return None
 
 
+_CART_BTN_SELECTORS = (
+    "button.prod-cart-btn",
+    "button[class*='cart-btn']",
+    "button:has-text('장바구니')",
+)
+
+
 def _is_sold_out(page) -> bool:
-    """품절 문구가 페이지에 있으면 True."""
+    """장바구니 담기 버튼이 보이고 활성화되어 있으면 in-stock(False),
+    버튼이 없거나 숨김/disabled면 OOS(True).
+
+    이전 구현은 페이지 전체에서 'text=품절' 매치를 썼지만, 쿠팡 PDP는 옵션
+    셀렉터/추천 캐러셀/마케팅 문구(품절임박 등) 등 메인 상품과 무관한 위치에서
+    '품절' 문구가 빈번히 노출되어 false-positive 가 다발했음. 메인 상품의
+    구매 가능 상태는 '장바구니 담기' 버튼 한 곳에만 반영되므로 그것만 본다.
+    """
+    for sel in _CART_BTN_SELECTORS:
+        btn = page.locator(sel).first
+        try:
+            btn.wait_for(state="visible", timeout=2000)
+        except Exception:
+            continue
+        try:
+            return btn.is_disabled()
+        except Exception:
+            return False
+    return True
+
+
+_QTY_PLUS_CLICK_JS = r"""
+() => {
+    // 쿠팡 PDP 수량 stepper 동작:
+    //  - input은 disabled 속성이 항상 붙어 있어 직접 값 변경 불가
+    //  - +/- 버튼도 disabled 속성이 붙어 있지만 JS click 핸들러는 정상 동작
+    //    (Playwright .click()은 actionability 체크에서 막힘 → JS .click() 사용)
+    //  - **주의**: 버튼의 textContent 라벨이 실제 동작과 반대.
+    //    '수량빼기' 라벨 버튼이 +, '수량더하기' 라벨 버튼이 -. 텍스트로 식별 금지.
+    //  - column 레이아웃 (PC, viewport >= 601)에서 위쪽(y 작은) 버튼이 +.
+    //    viewport는 init_browser에서 1280으로 강제하므로 항상 PC 레이아웃.
+    const btns = Array.from(document.querySelectorAll(
+        '.product-quantity button[type="button"]'
+    ))
+        .map(b => ({el: b, r: b.getBoundingClientRect()}))
+        .filter(b => b.r.width > 0 && b.r.height > 0)
+        .sort((a, b) => a.r.y - b.r.y);
+    if (btns.length === 0) return false;
+    btns[0].el.click();  // 가시 버튼 중 y가 가장 작은 = 위쪽 = '+'
+    return true;
+}
+"""
+
+
+_QTY_GET_VALUE_JS = (
+    "() => { const i = document.querySelector('.product-quantity input'); "
+    "return i ? parseInt(i.value || '0', 10) : 0; }"
+)
+
+
+def _set_quantity(page, quantity: int) -> bool:
+    """페이지 수량 stepper를 quantity로 설정. 성공 여부 반환.
+
+    쿠팡 PDP 수량 stepper의 비정상 동작:
+      - input은 disabled 속성이 항상 붙어 있어 직접 값 변경 불가
+      - +/- 버튼도 disabled 속성이 붙어 있고 Playwright .click() 으로는 막힘
+      - JS .click() 으로 클릭은 들어가지만 **매 두 번째 클릭만 값을 증가시킴**
+        (Coupang의 React 핸들러가 press/release를 분리 인식하는 듯)
+      - **텍스트 라벨이 실제 동작과 반대**: '수량빼기' 라벨 버튼이 +, '수량더하기'가 -
+        → 위치(y가 작은 = 위쪽) 로 + 식별
+    대응: 클릭 후 input 값이 변했는지 확인. 안 변했으면 다시 클릭. 무한 루프 방지를
+    위해 (quantity - 1) * 3 회까지만 시도.
+
+    quantity <= 1 이면 변경 불필요로 즉시 True.
+    """
+    if quantity <= 1:
+        return True
+
+    max_attempts = (quantity - 1) * 3  # 매 +1당 평균 2회 클릭이 필요, 안전 마진 3배
+    for attempt in range(max_attempts):
+        try:
+            current = int(page.evaluate(_QTY_GET_VALUE_JS) or 0)
+        except Exception:
+            logger.warning("[Coupang] 수량 input value 읽기 실패", exc_info=True)
+            return False
+        if current >= quantity:
+            return True
+        try:
+            clicked = page.evaluate(_QTY_PLUS_CLICK_JS)
+        except Exception:
+            logger.warning("[Coupang] 수량 + 클릭 evaluate 예외 (current=%d, 목표 %d)",
+                           current, quantity, exc_info=True)
+            return False
+        if not clicked:
+            logger.warning("[Coupang] 수량 + 클릭 대상 없음 (current=%d, 목표 %d)",
+                           current, quantity)
+            return False
+        time.sleep(0.5)  # 클릭 처리 + 다음 클릭 가능 상태 회복 대기
+
+    # 마지막 검증
     try:
-        for text in ("품절", "일시품절", "재고없음"):
-            if page.locator(f"text={text}").count() > 0:
-                return True
+        actual = int(page.evaluate(_QTY_GET_VALUE_JS) or 0)
     except Exception:
-        pass
-    return False
+        actual = -1
+    if actual != quantity:
+        logger.warning("[Coupang] 수량 stepper 최종=%d, 목표=%d (시도 %d회)",
+                       actual, quantity, max_attempts)
+        return False
+    return True
 
 
 def _click_add_to_cart(page, cfg: dict) -> bool:
     """장바구니 담기 버튼 클릭. 성공 여부 반환."""
-    selectors = [
-        "button.prod-cart-btn",
-        "button[class*='cart-btn']",
-        "button:has-text('장바구니')",
-    ]
-    for sel in selectors:
+    for sel in _CART_BTN_SELECTORS:
         try:
             btn = page.locator(sel).first
             if btn.count() == 0:
@@ -612,14 +711,21 @@ def add_single_item(page, item: dict) -> dict:
             if current_price is None:
                 last_error = "가격 추출 실패"
 
+            # 수량 설정 (최대재고 - 현재재고 만큼 채워야 하는 케이스: 예 장작 max=6, 현재 2 → 4)
+            requested_qty = int(item.get("quantity", 1) or 1)
+            if not _set_quantity(page, requested_qty):
+                last_error = f"수량 stepper 설정 실패 (목표 {requested_qty})"
+                _screenshot_on_error(page, item_name)
+                continue
+
             # 장바구니 담기 클릭
             if not _click_add_to_cart(page, cfg):
                 last_error = "장바구니 버튼 클릭 실패"
                 _screenshot_on_error(page, item_name)
                 continue
 
-            logger.info("[Coupang] 장바구니 담기 OK — %s (%s원)",
-                        item_name, current_price if current_price else "?")
+            logger.info("[Coupang] 장바구니 담기 OK — %s x%d (%s원)",
+                        item_name, requested_qty, current_price if current_price else "?")
             return {
                 "status": "ordered",
                 "price": current_price if current_price is not None else 0,
@@ -699,7 +805,7 @@ def add_items_to_cart(items: list[dict]) -> dict:
             result["stopped"] = True
             result["stop_reason"] = "session_expired"
             logger.error("[Coupang] 세션 무효 — 쿠키 재임포트 필요")
-            # 즉시 카카오 알림 (영구 1회 — 같은 만료 사유로 재발송 안 됨)
+            # 즉시 Discord 알림 (영구 1회 — 같은 만료 사유로 재발송 안 됨)
             send_stock_alert_safe(
                 "[쿠팡 세션 만료] 자동주문 중단됨.\n"
                 "Chrome에서 쿠팡 재로그인 → DevTools에서 쿠키 export →\n"

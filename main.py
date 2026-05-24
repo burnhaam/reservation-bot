@@ -1,16 +1,18 @@
 """
 숙박업 예약 자동화 진입점.
 
-매 시간 cron(Mac/Linux) 또는 Task Scheduler(Windows)에 의해 실행되며,
-다음 파이프라인을 순차적으로 수행한다.
+5분마다 Task Scheduler(Windows)/cron(Mac/Linux)으로 실행되며 다음을 수행한다.
 
     1) config.json / .env 로드
     2) SQLite DB 초기화 (reservations 테이블 없으면 생성)
-    3) detector.detect_new_reservations() — 네이버/에어비앤비 감지
-    4) 각 예약에 대해:
-        - 신규:  캘린더 등록 → DB INSERT → 반대 플랫폼 차단 → Discord 알림
-        - 취소:  캘린더 삭제 → DB UPDATE → 반대 플랫폼 해제 → Discord 알림
-    5) 처리 건수 요약 로그
+    3) detector.detect_airbnb() — 에어비앤비 신규/취소 감지 (네이버 신규는 웹훅 전용)
+    4) 신규 트리거: reservation_flow.claim_pending → finalize_if_ready
+        (트리거만으로 만들지 않고 Gmail 정보와 합쳐진 뒤 캘린더+알림 생성)
+       취소: 캘린더 삭제 → DB UPDATE → 반대 플랫폼 해제 → Discord 알림
+    5) reservation_flow.retry_pending() — pending 5~60분 재시도 + 60분 만료 강제확정
+       (0~5분 1분단위 재시도는 webhook_server 워처)
+    6) 네이버 하루 1회 백업 스윕 + 에어비앤비 차단 실반영 확인 알림
+    7) 처리 건수 요약 로그
 
 개별 예약 처리 중 예외가 발생해도 나머지는 계속 처리되며,
 logs/YYYY-MM-DD.log 파일에 스택트레이스와 함께 기록된다.
@@ -100,7 +102,7 @@ logger = logging.getLogger(__name__)
 # 모듈 import (로거 초기화 이후)
 # =============================================================
 
-from modules import blocker, calendar, detector, notifier  # noqa: E402
+from modules import blocker, calendar, detector, notifier, reservation_flow  # noqa: E402
 from modules.config_loader import load_config  # noqa: E402
 from modules.db import DB_PATH, get_connection, init_db  # noqa: E402
 from modules.env_loader import ENV_KEYS, load_env  # noqa: E402
@@ -373,7 +375,7 @@ def _handle_airbnb_modifications() -> int:
             )
 
             # 캘린더 B: 체크인 하루 + 연박 제목
-            staff_name = config.get("staff_name", "")
+            staff_name = calendar.resolve_staff_name(new_checkin, config)
             guests_str = str(row["guests"] or 2)
             if nights > 1:
                 summary_b = f"{staff_name} / 성인 {guests_str}명 (연박{nights}배)"
@@ -502,7 +504,7 @@ def _detect_ical_date_changes() -> int:
 
         # 날짜 변경 감지
         nights = (ical_co - ical_ci).days
-        staff_name = config.get("staff_name", "")
+        staff_name = calendar.resolve_staff_name(ical_ci, config)
         guests_str = str(row["guests"] or 2)
 
         calendar.update_event_dates(
@@ -788,14 +790,13 @@ def _update_reservations_from_gmail() -> int:
         return 0
 
     # 네이버 메일 정보 수집 (네이버 예약이 있을 때만)
+    # detect_naver()는 DB 중복 체크로 웹훅 기등록 건을 skip하므로,
+    # 보정용으로는 dedup 없는 collect_naver_email_data()를 사용한다.
     naver_by_checkin: dict[str, dict] = {}
     naver_rows = [r for r in rows if r["platform"] == "naver"]
     if naver_rows:
         try:
-            for em in detector.detect_naver():
-                ci = em.get("checkin")
-                if ci:
-                    naver_by_checkin[ci.isoformat() if hasattr(ci, 'isoformat') else ci] = em
+            naver_by_checkin = detector.collect_naver_email_data()
         except Exception as e:
             logger.warning("[업데이트] 네이버 메일 조회 실패: %s", e)
 
@@ -833,27 +834,31 @@ def _update_reservations_from_gmail() -> int:
         new_name = email_data.get("guest_name")
         needs_update = False
         updates: dict = {}
+        old_guests = row["guests"]
 
-        if new_guests and new_guests != row["guests"]:
+        if new_guests and new_guests != old_guests:
             updates["guests"] = new_guests
             needs_update = True
 
-        _placeholder_names = {"?", "", "확인필요", "Reserved", "(예약됨)"}
-        if new_name and old_name in _placeholder_names and new_name not in _placeholder_names:
-            updates["guest_name"] = new_name
-            needs_update = True
+        # 네이버 Gmail은 이름이 "최*현"처럼 마스킹되어 도착 — 이름은 웹훅에서 받은 값을 그대로 유지.
+        # 에어비앤비 Gmail은 풀네임이 정상 도착하므로 placeholder만 실제 이름으로 교체.
+        if platform == "airbnb":
+            _placeholder_names = {"?", "", "확인필요", "Reserved", "(예약됨)"}
+            if new_name and old_name in _placeholder_names and new_name not in _placeholder_names:
+                updates["guest_name"] = new_name
+                needs_update = True
 
         if not needs_update:
             continue
 
         final_name = updates.get("guest_name", old_name)
-        final_guests = updates.get("guests", row["guests"])
+        final_guests = updates.get("guests", old_guests)
 
         from modules.detector import _to_date
         ci = _to_date(row["checkin"])
         co = _to_date(row["checkout"])
         nights = (co - ci).days if ci and co else 1
-        staff_name = config.get("staff_name", "")
+        staff_name = calendar.resolve_staff_name(ci, config) if ci else config.get("staff_name", "")
 
         summary_a = f"{prefix}. {final_name}. {final_guests}인"
         if nights > 1:
@@ -874,9 +879,68 @@ def _update_reservations_from_gmail() -> int:
             conn.commit()
 
         logger.info("[업데이트] %s/%s: %s", platform, final_name, updates)
+
+        if "guests" in updates:
+            notifier._send_message(
+                f"[인원 수 업데이트] {final_name}님 ({row['checkin']}~{row['checkout']})\n"
+                f"👥 {old_guests}인 → {final_guests}인\n"
+                "✅ 캘린더 반영 완료",
+                dedup_key=f"guests_update:{row['booking_id']}:{old_guests}->{final_guests}",
+            )
+
         updated += 1
 
     return updated
+
+
+def _run_naver_backup_sweep_if_due() -> None:
+    """하루 1회 Gmail 전체 스캔으로 웹훅이 완전히 누락한 네이버 신규/취소를 복구.
+
+    평소 네이버 신규는 웹훅(+1시간 보정)으로 처리되지만, 양쪽 폰이 모두 웹훅을 놓친
+    경우의 안전망이다. detect_naver(백업 쿼리=2일)는 DB 중복 체크가 내장되어 이미
+    claim/확정된 건은 건너뛴다. data/naver_backup_state.json 으로 같은 날 1회만 실행.
+    """
+    state_path = PROJECT_ROOT / "data" / "naver_backup_state.json"
+    today_str = date.today().isoformat()
+    try:
+        if state_path.exists():
+            st = json.loads(state_path.read_text(encoding="utf-8")) or {}
+            if st.get("last_run") == today_str:
+                return
+    except Exception:
+        logger.warning("[백업] 상태 파일 로드 실패 (강행)", exc_info=True)
+
+    logger.info("[백업] 네이버 백업 스윕 시작")
+    try:
+        events = detector.detect_naver(query=detector._NAVER_GMAIL_QUERY_BACKUP)
+    except Exception:
+        logger.exception("[백업] detect_naver 실패")
+        return
+
+    new_cnt = cancel_cnt = 0
+    for e in events:
+        booking_id = e.get("booking_id")
+        try:
+            if e.get("action") == "new":
+                # 누락분 복구 — 메일 정보가 이미 있으므로 즉시 확정(없으면 기본 인원).
+                if reservation_flow.claim_pending(e):
+                    reservation_flow.finalize_if_ready(booking_id, force_base=True)
+                    new_cnt += 1
+            elif e.get("action") == "cancel":
+                if _handle_cancel(e):
+                    cancel_cnt += 1
+        except Exception:
+            logger.exception("[백업] 이벤트 처리 예외: %s", booking_id)
+
+    logger.info("[백업] 네이버 백업 스윕 완료: 신규 %d, 취소 %d", new_cnt, cancel_cnt)
+
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"last_run": today_str}, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning("[백업] 상태 파일 저장 실패", exc_info=True)
 
 
 def run_pipeline() -> int:
@@ -903,18 +967,21 @@ def run_pipeline() -> int:
     stat_update = stat_modify = stat_samhaengsi = stat_cleanup = stat_ical_change = 0
 
     try:
-        reservations = detector.detect_new_reservations()
-        logger.info("감지된 예약 이벤트: %d건", len(reservations))
+        # 신규/취소 트리거는 에어비앤비(iCal diff)만 5분 폴링. 네이버 신규는 웹훅 전용
+        # (+ 하루 1회 백업 스윕). 신규는 즉시 생성하지 않고 claim→finalize 로 Gmail 정보와
+        # 합쳐진 뒤에야 캘린더/알림이 생성된다(merge-before-create).
+        reservations = detector.detect_airbnb()
+        logger.info("감지된 에어비앤비 이벤트: %d건", len(reservations))
 
         for r in reservations:
             action = r.get("action")
             booking_id = r.get("booking_id")
             try:
                 if action == "new":
-                    if _handle_new(r):
+                    # claim 성공 = 신규 트리거. 중복(이미 claim/확정)은 정상이라 실패 아님.
+                    if reservation_flow.claim_pending(r):
+                        reservation_flow.finalize_if_ready(booking_id)
                         stat_new += 1
-                    else:
-                        stat_fail += 1
                 elif action == "cancel":
                     if _handle_cancel(r):
                         stat_cancel += 1
@@ -928,12 +995,25 @@ def run_pipeline() -> int:
                 stat_fail += 1
                 logger.exception("예약 처리 중 예외 (booking_id=%s)", booking_id)
 
-        # 예약 정보 업데이트 (Gmail 메일 기반 — 인원수/이름)
+        # pending_email 재시도: 5~60분 구간 + 60분 만료 시 기본 인원 강제 확정.
+        # 0~5분 빠른 재시도(1분 간격)는 webhook_server 워처가 담당한다.
         try:
-            stat_update = _update_reservations_from_gmail()
+            stat_update = reservation_flow.retry_pending()
         except Exception:
             stat_update = 0
-            logger.exception("예약 정보 업데이트 중 예외")
+            logger.exception("pending 재시도 중 예외")
+
+        # 네이버 하루 1회 백업 스윕 (양쪽 폰 모두 웹훅 누락 시 복구)
+        try:
+            _run_naver_backup_sweep_if_due()
+        except Exception:
+            logger.exception("네이버 백업 스윕 중 예외")
+
+        # 에어비앤비가 우리 차단을 실제 반영(iCal 'Not available')했는지 확인 → 차단완료 알림
+        try:
+            reservation_flow.confirm_airbnb_blocks()
+        except Exception:
+            logger.exception("에어비앤비 차단 확인 중 예외")
 
         # 에어비앤비 예약 변경 처리
         try:
@@ -1459,61 +1539,73 @@ def run_stock_pipeline() -> int:
     return len(candidates)
 
 
+_SCAN_SLOTS = {21: "evening", 7: "morning"}
+
+
 def _run_order_confirmation_scan_if_due() -> None:
-    """매일 07시대 1회, 3일+ 경과 미확정(scan_done_at NULL) stock_orders 가 있으면
-    주문내역 스캔 + 로직 ①③ 실행.
+    """매일 21시대 / 07시대 각 1회, 미확정(scan_done_at NULL) stock_orders 가 있으면
+    주문내역 스캔 + 로직 ①③ 실행 (URL 교체 / 매핑 자동 학습).
 
-    Akamai 리스크 최소화 설계:
-    - 발동 시각: 07:00~07:59 (쿠팡 저트래픽 시간대)
-    - 대상: status='ordered' AND scan_done_at IS NULL AND detected_at <= now-3일
-    - 스캔 후 대상 레코드 모두 scan_done_at 세팅 → 다시는 스캔 안 함
-    - 조건 미충족 시 브라우저조차 열지 않음
+    트리거 슬롯:
+    - 21:00~21:59 (evening): 봇이 낮에 처리한 건 사용자가 저녁에 수동 주문하는 경우가
+      많아 당일 안에 매핑 정정. 사용자 워크플로우상 핵심 슬롯.
+    - 07:00~07:59 (morning): 전날까지 결제 안 된 건 매일 아침 재확인.
 
-    data/scan_state.json 의 last_run 날짜로 같은 날 1회만 실행.
+    대상: status='ordered'/'skipped'/'failed' AND scan_done_at IS NULL (경과일 무관).
+    재스캔 정책: scan_done_at 은 디스코드 알림이 발송된 레코드에만 세팅 — 사용자가 한 번
+    알림을 받았으면 그 건은 더 이상 스캔 안 함. 알림 미발송 미확인 건은 다음 슬롯에 재시도.
+
+    멱등성: data/scan_state.json 의 last_run_{slot} 키로 슬롯별 같은 날 1회만 실행.
+    조건 미충족 시 브라우저조차 열지 않음 (Akamai 리스크 + 비용 최소화).
     """
     now = datetime.now()
-    if now.hour != 7:
+    slot = _SCAN_SLOTS.get(now.hour)
+    if not slot:
         return
 
     # 사전 체크: 대상 레코드 있는지 확인 (브라우저 열기 전)
     try:
         from modules.product_matcher import _stock_orders_pending_scan
-        pending = _stock_orders_pending_scan(min_age_days=3)
+        pending = _stock_orders_pending_scan(min_age_days=0)
     except Exception:
         logger.exception("[Scan] 미확정 레코드 조회 실패")
         return
     if not pending:
-        return  # 조용히 종료 (매일 07시 호출되므로 로그 남기지 않음)
+        return  # 조용히 종료 (매 사이클 호출되므로 로그 남기지 않음)
 
     state_path = PROJECT_ROOT / "data" / "scan_state.json"
     today_str = now.strftime("%Y-%m-%d")
+    state_key = f"last_run_{slot}"
+    state: dict = {}
     try:
         if state_path.exists():
             import json as _json
-            last = _json.loads(state_path.read_text(encoding="utf-8")).get("last_run", "")
-            if last == today_str:
-                logger.info("[Scan] 오늘 이미 실행됨 — 스킵")
+            state = _json.loads(state_path.read_text(encoding="utf-8")) or {}
+            if state.get(state_key) == today_str:
+                logger.info("[Scan:%s] 오늘 슬롯 이미 실행됨 — 스킵", slot)
                 return
     except Exception:
-        logger.warning("[Scan] 상태 파일 로드 실패 (강행)", exc_info=True)
+        logger.warning("[Scan:%s] 상태 파일 로드 실패 (강행)", slot, exc_info=True)
+        state = {}
 
-    logger.info("[Scan] 주문 확인 스캔 시작 — 대상 %d건", len(pending))
+    logger.info("[Scan:%s] 주문 확인 스캔 시작 — 대상 %d건", slot, len(pending))
     try:
         from modules.coupang_orderer import (
             init_browser, close_browser, is_session_valid, _is_cdp_available,
         )
         from modules.product_matcher import sync_mapping_from_orders
         if not _is_cdp_available():
-            logger.warning("[Scan] CDP 미가용 — 스캔 스킵")
+            logger.warning("[Scan:%s] CDP 미가용 — 스캔 스킵", slot)
             return
         p, browser, ctx, page = init_browser()
         try:
             if not is_session_valid(page):
-                logger.warning("[Scan] 세션 무효 — 스캔 스킵")
+                logger.warning("[Scan:%s] 세션 무효 — 스캔 스킵", slot)
                 return
             result = sync_mapping_from_orders(page, mode="scheduled", lookback_days=14)
             logger.info(
-                "[Scan] 결과: confirmed=%d unconfirmed=%d added=%d pending=%d",
+                "[Scan:%s] 결과: confirmed=%d unconfirmed=%d added=%d pending=%d",
+                slot,
                 len(result.get("confirmed", [])),
                 len(result.get("unconfirmed", [])),
                 len(result.get("added", [])),
@@ -1522,18 +1614,19 @@ def _run_order_confirmation_scan_if_due() -> None:
         finally:
             close_browser(p, browser, ctx, page)
 
-        # 멱등 플래그 저장 (브라우저 정상 종료 후)
+        # 슬롯 멱등 플래그 저장 (브라우저 정상 종료 후)
         try:
             import json as _json
+            state[state_key] = today_str
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(
-                _json.dumps({"last_run": today_str}, ensure_ascii=False, indent=2),
+                _json.dumps(state, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception:
-            logger.warning("[Scan] 상태 파일 저장 실패", exc_info=True)
+            logger.warning("[Scan:%s] 상태 파일 저장 실패", slot, exc_info=True)
     except Exception:
-        logger.exception("[Scan] 주문 확인 스캔 중 예외")
+        logger.exception("[Scan:%s] 주문 확인 스캔 중 예외", slot)
 
 
 def _record_last_success() -> None:

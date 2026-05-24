@@ -2,8 +2,8 @@
 
 네이버 플레이스 예약과 에어비앤비 예약을 주기적으로 감지해서
 네이버 캘린더 2곳에 일정을 자동 등록/삭제하고, 상대 플랫폼의
-해당 날짜를 자동으로 차단/해제하며, 처리 결과를 카카오톡으로
-나에게 보내기로 알려주는 자동화 도구입니다.
+해당 날짜를 자동으로 차단/해제하며, 처리 결과를 Discord 채널로
+알려주는 자동화 도구입니다.
 
 ---
 
@@ -27,7 +27,7 @@ reservation-bot/
     ├── db.py
     ├── detector.py      # 1단계: 예약 감지
     ├── calendar.py      # 2단계: 네이버 캘린더 연동
-    ├── notifier.py      # 3단계: 카카오 알림
+    ├── notifier.py      # 3단계: Discord 알림
     └── blocker.py       # 4단계: 플랫폼 간 날짜 차단/해제
 ```
 
@@ -64,9 +64,9 @@ playwright install chromium
 | `NAVER_REFRESH_TOKEN` | 최초 OAuth 인증으로 얻은 리프레시 토큰 |
 | `AIRBNB_ICAL_URL` | 에어비앤비 숙소 관리 → 캘린더 → 캘린더 내보내기 URL |
 | `NAVER_PLACE_ID` | 네이버 스마트플레이스 업체 ID |
-| `KAKAO_REST_API_KEY` | 카카오 개발자 콘솔 앱의 REST API 키 |
-| `KAKAO_ACCESS_TOKEN` | 카카오 로그인 후 얻은 액세스 토큰 |
-| `KAKAO_REFRESH_TOKEN` | 위와 함께 얻은 리프레시 토큰 |
+| `DISCORD_WEBHOOK_URL` | 알림 채널의 웹훅 URL |
+| `DISCORD_BOT_TOKEN` | 매핑 승인 봇 토큰 (선택) |
+| `DISCORD_CHANNEL_ID` | 승인 버튼 메시지 발송 채널 ID (선택) |
 
 토큰은 실행 중 자동 갱신되어 `.env` 파일에 다시 저장됩니다.
 

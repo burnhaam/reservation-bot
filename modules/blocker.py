@@ -123,9 +123,9 @@ def _push_to_github(local_path: Path) -> bool:
 
     try:
         from datetime import date
-        from modules.notifier import _send_kakao_message
+        from modules.notifier import _send_message
         # 같은 날 같은 사유 알림은 영구 1회
-        _send_kakao_message(
+        _send_message(
             "[GitHub push 실패] blocked.ics 수동 확인 필요",
             dedup_key=f"github_push_failed:{date.today().isoformat()}",
             cooldown_hours=None,

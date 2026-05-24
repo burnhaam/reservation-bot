@@ -1,5 +1,7 @@
 {
   "staff_name": "최자임님",
+  "staff_name_weekday": "최자임님",
+  "staff_name_weekend": "조성은님",
   "polling_interval_minutes": 5,
   "naver_owner_calendar": "소유 일정관리",
   "naver_staff_calendar": "소캠스 예약일정",
@@ -11,7 +13,6 @@
   "naver_block_method": "api",
   "base_guests": 2,
   "notifications": {
-    "kakao_enabled": false,
     "discord_enabled": true
   },
   "stock": {

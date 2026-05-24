@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>쿠팡 장바구니로 이동</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Segoe UI', sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; margin: 0; background: #f5f5f5; color: #222;
+    }
+    .card {
+      background: #fff; padding: 28px 24px; border-radius: 14px;
+      max-width: 360px; width: 88%; text-align: center;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+    }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { color: #666; margin: 8px 0; font-size: 14px; line-height: 1.5; }
+    .btn {
+      display: inline-block; margin-top: 16px; padding: 12px 22px;
+      background: #ff5722; color: #fff; text-decoration: none;
+      border: 0; border-radius: 8px; font-size: 15px; font-weight: 600;
+    }
+    .fallback { margin-top: 22px; font-size: 12px; color: #999; }
+    .fallback a { color: #999; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>쿠팡 장바구니로 이동 중…</h1>
+    <p>앱이 자동으로 열리지 않으면 아래 버튼을 눌러주세요.</p>
+    <a class="btn" id="manual" href="coupang://cart">쿠팡 앱 열기</a>
+    <p class="fallback">
+      앱이 없으시면 <a href="https://cart.coupang.com/cartView.pang">웹 카트</a>로 이동
+    </p>
+  </div>
+
+  <script>
+    // 모바일에서 쿠팡 앱으로 자동 점프 시도.
+    // Android: intent:// URL (Chrome/Samsung Browser/대부분의 in-app browser가 지원).
+    //   - 앱 설치돼 있으면 즉시 앱으로
+    //   - 미설치면 browser_fallback_url로 자동 폴백
+    // iOS: coupang:// 커스텀 스킴 시도 → 1.5초 내 폴백 없으면 웹.
+    //   (iOS는 intent:// 미지원)
+    // Desktop: 모바일 아니므로 그냥 웹 카트로 안내.
+    const ua = navigator.userAgent.toLowerCase();
+    const isAndroid = /android/.test(ua);
+    const isIOS = /iphone|ipad|ipod/.test(ua);
+    const WEB = 'https://cart.coupang.com/cartView.pang';
+
+    if (isAndroid) {
+      const intentUrl =
+        'intent://cart.coupang.com/cartView.pang' +
+        '#Intent;scheme=https;package=com.coupang.mobile' +
+        ';S.browser_fallback_url=' + encodeURIComponent(WEB) + ';end';
+      window.location.href = intentUrl;
+    } else if (isIOS) {
+      // iOS는 커스텀 스킴 시도
+      const start = Date.now();
+      window.location.href = 'coupang://cart';
+      // 1.5초 후 페이지가 살아있으면 = 앱 없음 → 웹으로
+      setTimeout(() => {
+        if (!document.hidden && Date.now() - start >= 1400) {
+          window.location.href = WEB;
+        }
+      }, 1500);
+    } else {
+      // PC는 웹으로
+      window.location.href = WEB;
+    }
+  </script>
+</body>
+</html>

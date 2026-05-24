@@ -25,6 +25,26 @@ _google_calendar_id_cache: dict[str, str] = {}
 
 
 # =============================================================
+# 담당자명 (체크인 요일 기반)
+# =============================================================
+
+def resolve_staff_name(checkin: date, config: Optional[dict] = None) -> str:
+    """체크인 날짜의 요일에 따라 담당자명을 반환. 토/일=주말, 그 외=평일.
+
+    config에 staff_name_weekend/staff_name_weekday가 없으면 staff_name으로 폴백.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+    fallback = config.get("staff_name", "")
+    if isinstance(checkin, date) and checkin.weekday() >= 5:
+        return config.get("staff_name_weekend") or fallback
+    return config.get("staff_name_weekday") or fallback
+
+
+# =============================================================
 # 이름 정규화
 # =============================================================
 
@@ -176,7 +196,7 @@ def create_events(reservation: dict) -> dict:
 
     nights = (checkout - checkin).days
     summary_a = f"{prefix}. {guest_name}. {guests_str}인"
-    staff_name = config.get("staff_name", "")
+    staff_name = resolve_staff_name(checkin, config)
     if nights > 1:
         summary_b = f"{staff_name} / 성인 {guests_str}명 (연박{nights}배)"
     else:

@@ -864,6 +864,20 @@ def find_orders_containing_items(
     return result
 
 
+def _extract_product_id(url: str) -> str:
+    """쿠팡 /vp/products/PROD 경로의 PROD(상품 고유 ID) 추출. 없으면 빈 문자열.
+
+    vendorItemId(변형 옵션) 가 달라도 동일 상품이면 productId 는 같음.
+    텍스트 매칭이 실패하는 케이스(메모 일반어 vs 신규 product 상세 title)에서도
+    URL 기반 매칭으로 동일 상품을 식별하기 위한 핵심 키.
+    """
+    if not url:
+        return ""
+    import re
+    m = re.search(r"/vp/products/(\d+)", url)
+    return m.group(1) if m else ""
+
+
 def _canonical_product_url(url: str) -> str:
     """비교/저장용 URL 정규화. /vp/products/PROD?itemId=N&vendorItemId=M 만 유지.
 
@@ -990,6 +1004,82 @@ def _generalize_product_title(detailed_title: str) -> str:
         return cleaned
 
 
+def _gemini_keyword_relevance(memo_item: str, product_title: str) -> dict:
+    """'메모 단어로 사용자가 이 상품을 가리켰을 가능성이 조금이라도 있는가?' 판정.
+
+    `_gemini_similarity_check` 보다 훨씬 lenient. 같은 카테고리/대체 상품/메모가
+    일반어이고 product 가 그 카테고리의 구체적 상품인 경우 모두 relevant=true.
+    완전히 다른 카테고리 또는 무관할 때만 false.
+
+    이 함수는 Phase 4 fallback — 신규 매핑 생성 직전에 호출되어, 가능하면
+    기존 메모 entry URL 교체로 유도해 메모-매핑 연결을 유지한다 ('메모에 있는 품목은
+    가급적 모두 시킨다' 정책).
+
+    반환: {"relevant": bool, "reason": str}
+    Gemini 미가용/오류 시 relevant=False (안전 측 — false negative 우선).
+    """
+    cleaned_memo = (memo_item or "").strip()
+    cleaned_title = (product_title or "").strip()
+    if not cleaned_memo or not cleaned_title:
+        return {"relevant": False, "reason": "입력 비어있음"}
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not _HAS_GENAI or not api_key:
+        return {"relevant": False, "reason": "Gemini 미가용"}
+
+    prompt = f"""사용자 재고 메모 단어와 쿠팡 주문 상품의 연관성 판단:
+- 메모 단어: "{cleaned_memo}"
+- 쿠팡 상품명: "{cleaned_title}"
+
+질문: 사용자가 메모에 "{cleaned_memo}" 라고 적었을 때 이 상품 "{cleaned_title}" 을(를) 의도했을 가능성이 조금이라도 있는가?
+
+규칙:
+- 같은 카테고리(예: '생수' ↔ 어떤 브랜드의 샘물/생수)면 relevant=true
+- 대체 상품(예: '야광봉' ↔ '야광팔찌')이면 relevant=true
+- 일반어 메모 ↔ 그 카테고리의 구체적 상품이면 relevant=true
+- 브랜드명 일부라도 일치하면 relevant=true
+- 완전히 무관한 카테고리(예: '생수' ↔ '주방세제')만 relevant=false
+
+JSON 한 줄로만 답변:"""
+
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "relevant": {"type": "BOOLEAN"},
+            "reason": {"type": "STRING"},
+        },
+        "required": ["relevant"],
+    }
+    try:
+        from modules.gemini_client import generate_content_with_fallback
+        response = generate_content_with_fallback(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=schema,
+                max_output_tokens=128,
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                http_options=types.HttpOptions(timeout=15000),
+            ),
+        )
+        text = getattr(response, "text", None) or ""
+        if not text:
+            return {"relevant": False, "reason": "빈 응답"}
+        parsed = json.loads(text)
+        return {
+            "relevant": bool(parsed.get("relevant", False)),
+            "reason": str(parsed.get("reason", ""))[:100],
+        }
+    except APIError as e:
+        logger.warning("[Matcher:Relevance] Gemini API 오류: %s", e)
+        return {"relevant": False, "reason": "API 오류"}
+    except Exception:
+        logger.exception("[Matcher:Relevance] 예외")
+        return {"relevant": False, "reason": "예외"}
+
+
 def _gemini_similarity_check(memo_item: str, product_title: str) -> dict:
     """'이 메모 품목과 이 주문 상품이 동일 제품인가?' Gemini 판정.
 
@@ -1108,7 +1198,7 @@ def _stock_unmapped_last_n_days(n_days: int = 14) -> list[str]:
                 "SELECT DISTINCT item_name "
                 "FROM stock_orders "
                 "WHERE status = 'unmapped' "
-                "AND datetime(detected_at) >= datetime('now', ?)",
+                "AND datetime(detected_at) >= datetime('now', 'localtime', ?)",
                 (f"-{int(n_days)} days",),
             )
             return [r["item_name"] for r in cur.fetchall() if r["item_name"]]
@@ -1135,7 +1225,7 @@ def _stock_orders_pending_scan(min_age_days: int = 3) -> list[dict]:
                 "FROM stock_orders "
                 "WHERE status IN ('ordered', 'skipped', 'failed') "
                 "AND scan_done_at IS NULL "
-                "AND datetime(detected_at) <= datetime('now', ?)",
+                "AND datetime(detected_at) <= datetime('now', 'localtime', ?)",
                 (f"-{int(min_age_days)} days",),
             )
             return [dict(r) for r in cur.fetchall()]
@@ -1257,9 +1347,11 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             }
 
     if mode == "scheduled":
-        pending_records = _stock_orders_pending_scan(min_age_days=3)
+        # 경과일 가드 제거: 봇 처리 직후 슬롯(당일 21시)부터 스캔 가능하도록 0일.
+        # 미확정 건이 다음 슬롯에 재시도되도록 scan_done_at 마킹 정책도 아래에서 변경.
+        pending_records = _stock_orders_pending_scan(min_age_days=0)
         if not pending_records:
-            logger.info("[Matcher:Sync] 3일+ 미확정 레코드 없음 — 스킵")
+            logger.info("[Matcher:Sync] 미확정 레코드 없음 — 스킵")
             return result
         for r in pending_records:
             nm = r.get("item_name")
@@ -1279,19 +1371,18 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             logger.info("[Matcher:Sync] 최근 %d일 stock 기록 없음 — 스킵", lookback_days)
             return result
         ordered_names = {o["item_name"] for o in ordered if o.get("item_name")}
-        for o in ordered:
-            _track_current(
-                o.get("item_name") or "", o.get("matched_url") or "",
-                o.get("status") or "", o.get("quantity"),
-            )
+        # 의도적으로 _track_current 호출 안 함 — instant 모드는 로직 ②(신규 매핑 학습)
+        # 전용. mapping_update 검출은 scheduled 슬롯(21시/07시)에서만 수행해야 메모
+        # 사이클마다 이전 주문 건 카드가 재발송되는 노이즈가 없음.
+        # current_url_by_name 이 비어 있으면 아래 mapping_update 블록은 자연스럽게 no-op.
 
     # --- 검색 기반 묶음 수집 (기본 페이지 5건 한계 회피) ---
     groups = find_orders_containing_items(page, sorted(ordered_names), lookback_days=lookback_days)
     if not groups:
         logger.info("[Matcher:Sync] 검색 기반 묶음 0건")
         if mode == "scheduled":
-            all_ids = [rid for ids in name_to_ids.values() for rid in ids]
-            _mark_scan_result([], all_ids)
+            # 미확정 — scan_done_at 세팅하지 않음 (다음 슬롯에 재시도).
+            # "주문확인 후 디스코드 알림 발송된 건만 더 이상 확인 안 함" 정책.
             result["unconfirmed"] = sorted(ordered_names)
         return result
 
@@ -1353,6 +1444,77 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
                     still_unmatched.append(prod)
             unmatched_products = still_unmatched
 
+        # Phase 3: URL(productId) 기반 매칭 — 텍스트 매칭이 모두 실패해도
+        # unmatched product 의 productId 가 이미 매핑된 어떤 entry 의 URL productId
+        # 와 일치하면 동일 상품으로 간주 (예: 메모 '생수' entry url=...7689270513
+        # ↔ 신규 product url=...7689270513?vendorItemId=...).
+        # 일반어 메모 vs 브랜드명 product title 같은 어휘 불일치 케이스를 잡아준다.
+        # 비용: 어차피 신규 매핑 단계에서 resolve_product_url 호출되므로 추가 비용 0
+        # (해석 결과를 prod 에 캐시해 재호출 방지).
+        if unmatched_products and ordered_names:
+            still_unmatched_phase3: list[dict] = []
+            # productId → canonical(메모명) 역인덱스. 본 URL + variants URL 모두 포함.
+            mapping_url_index: dict[str, str] = {}
+            for canonical in ordered_names:
+                entry = items.get(canonical)
+                if not entry:
+                    continue
+                pid = _extract_product_id(entry.get("url", ""))
+                if pid:
+                    mapping_url_index[pid] = canonical
+                for v in entry.get("variants", []) or []:
+                    vpid = _extract_product_id(v.get("url", ""))
+                    if vpid:
+                        mapping_url_index.setdefault(vpid, canonical)
+            for prod in unmatched_products:
+                if not mapping_url_index:
+                    still_unmatched_phase3.append(prod)
+                    continue
+                resolved_url = resolve_product_url(page, prod["sdp_href"])
+                prod["_resolved_url"] = resolved_url  # 후속 단계 재해석 방지 캐시
+                new_pid = _extract_product_id(resolved_url) if resolved_url else ""
+                target_canonical = mapping_url_index.get(new_pid) if new_pid else None
+                if target_canonical and target_canonical not in matched_names:
+                    matched_names.add(target_canonical)
+                    matched_product_by_name.setdefault(target_canonical, prod)
+                    logger.info(
+                        "[Matcher:Sync] URL 매칭(Phase3): '%s' (productId=%s) ≈ '%s'",
+                        target_canonical, new_pid, prod["title"][:40],
+                    )
+                else:
+                    still_unmatched_phase3.append(prod)
+            unmatched_products = still_unmatched_phase3
+
+        # Phase 4: 키워드/카테고리 연관성 fallback — 정책상 '메모 품목은 가급적 시킨다'.
+        # Phase 2 Gemini 가 '같은 브랜드/용량' 기준이라 거절한 케이스라도, 메모와 product
+        # 사이에 키워드 또는 카테고리 연관성이 조금이라도 있으면 신규 매핑 생성보다
+        # 기존 메모 entry 의 URL 교체(mapping_update) 를 우선한다.
+        # 예) 메모 '야광봉' ↔ 신규 product '마메 LED 야광팔찌 100p' — 모양은 달라도
+        #     사용자가 메모에 같은 단어로 적을 만한 대체 상품.
+        if unmatched_products and ordered_names:
+            still_unmatched_phase4: list[dict] = []
+            for prod in unmatched_products:
+                rescued = None
+                for memo_name in ordered_names:
+                    if memo_name in matched_names:
+                        continue
+                    if not items.get(memo_name):
+                        continue  # mapping 에 없는 메모 — 별도 신규 매핑 흐름
+                    rel = _gemini_keyword_relevance(memo_name, prod["title"])
+                    if rel["relevant"]:
+                        rescued = memo_name
+                        logger.info(
+                            "[Matcher:Sync] 키워드 연관성(Phase4): '%s' ↔ '%s' (%s)",
+                            memo_name, prod["title"][:40], rel.get("reason", "")[:60],
+                        )
+                        break
+                if rescued:
+                    matched_names.add(rescued)
+                    matched_product_by_name.setdefault(rescued, prod)
+                else:
+                    still_unmatched_phase4.append(prod)
+            unmatched_products = still_unmatched_phase4
+
         if not matched_names:
             continue  # 순수 개인 주문
 
@@ -1378,9 +1540,10 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             prod = matched_product_by_name.get(name)
             if not prod:
                 continue
-            new_url = resolve_product_url(page, prod["sdp_href"])
+            new_url = prod.get("_resolved_url") or resolve_product_url(page, prod["sdp_href"])
             if not new_url:
                 continue
+            prod["_resolved_url"] = new_url
             # URL 비교 — _canonical_product_url 로 itemId/vendorItemId 보존한 채 비교.
             #   다른 product code → 다른 상품 / 같은 code 라도 다른 vendorItemId →
             #   사용자가 실제로 산 변형(향·색·팩사이즈)이 봇 매핑과 다른 케이스.
@@ -1457,8 +1620,8 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             # 동일 브랜드·제품의 색/사이즈/맛 변형이 같은 canonical 로 수렴하도록 함.
             canonical = _generalize_product_title(title)
 
-            # URL 선해석 — variants 추가/신규 공통으로 필요
-            clean_url = resolve_product_url(page, prod["sdp_href"])
+            # URL 선해석 — variants 추가/신규 공통으로 필요 (Phase3/Phase4 캐시 활용)
+            clean_url = prod.get("_resolved_url") or resolve_product_url(page, prod["sdp_href"])
             if not clean_url:
                 logger.warning("[Matcher:Sync] URL 해석 실패 — 매핑 스킵: %s", title[:40])
                 continue
@@ -1556,7 +1719,32 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
     # --- 로직 ③ + 스캔 결과 기록 (scheduled 모드만) ---
     if mode == "scheduled":
         unconfirmed_names = ordered_names - confirmed_names
+
+        # disable 제안 가드: name 의 가장 오래된 stock_orders.detected_at 이 3일+ 일 때만.
+        # 슬롯 단위 가드(min_age_days)는 0으로 풀렸지만, disable 제안은 "사용자가 깜빡
+        # 잊고 결제 안 한 케이스" 를 잡는 것이므로 첫날부터 띄우면 노이즈가 큼.
+        from datetime import datetime as _dt, timedelta as _td
+        disable_threshold = _dt.now() - _td(days=3)
+        oldest_detected_by_name: dict = {}
+        for r in pending_records:
+            nm = r.get("item_name")
+            detected = r.get("detected_at")
+            if not nm or not detected:
+                continue
+            try:
+                dt_val = (_dt.fromisoformat(detected) if isinstance(detected, str)
+                          else detected)
+            except Exception:
+                continue
+            prev = oldest_detected_by_name.get(nm)
+            if prev is None or dt_val < prev:
+                oldest_detected_by_name[nm] = dt_val
+
+        disable_notified_names: set[str] = set()
         for name in sorted(unconfirmed_names):
+            oldest = oldest_detected_by_name.get(name)
+            if oldest is None or oldest > disable_threshold:
+                continue  # 3일 안 됨 → 다음 슬롯에 재시도
             entry = items.get(name)
             if not entry or not entry.get("자동주문_허용", True):
                 continue
@@ -1569,15 +1757,21 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
             )
             result["pending"].append({"id": pid, "title": name, "action": "disable"})
             logger.info("[Matcher:Sync] disable 승인 대기: #%d %s", pid, name[:40])
+            disable_notified_names.add(name)
 
+        # scan_done_at 마킹 정책: 사용자에게 알림이 발송된 레코드만 세팅.
+        #   - confirmed (실주문 확인 알림 / mapping_update 카드 발송) → scan_done_at
+        #   - disable 제안 카드 발송 → scan_done_at
+        #   - 그 외 (실주문 미발견, 3일 미경과 등) → scan_done_at NULL 유지 → 다음 슬롯 재시도
         confirmed_ids: list[int] = []
-        unconfirmed_ids: list[int] = []
+        notified_unconfirmed_ids: list[int] = []
         for name, ids in name_to_ids.items():
             if name in confirmed_names:
                 confirmed_ids.extend(ids)
-            else:
-                unconfirmed_ids.extend(ids)
-        _mark_scan_result(confirmed_ids, unconfirmed_ids)
+            elif name in disable_notified_names:
+                notified_unconfirmed_ids.extend(ids)
+            # else: scan_done_at 안 세팅 → 매일 07시 슬롯에 재시도
+        _mark_scan_result(confirmed_ids, notified_unconfirmed_ids)
         result["confirmed"] = sorted(confirmed_names)
         result["unconfirmed"] = sorted(unconfirmed_names)
 
@@ -1585,7 +1779,10 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
     if result["added"]:
         _save_mapping(mapping)
 
-    if any([result["added"], result["pending"], result["confirmed"], result["updated"]]):
+    # 디스코드 요약 알림: 개별 카드가 안 나가는 confirmed/added 만 요약.
+    # updated/pending 은 add_pending() 이 이미 항목별 승인 카드를 보내므로 요약에서 제외
+    # (이전엔 같은 정보가 카드 + 요약 2회 노출되어 노이즈가 컸음).
+    if result["added"] or result["confirmed"]:
         try:
             from modules.notifier import _send_discord_webhook
             lines = [f"**매핑 자동 학습 — mode={mode}**"]
@@ -1598,14 +1795,6 @@ def sync_mapping_from_orders(page, mode: str = "instant", lookback_days: int = 1
                 for a in result["added"][:10]:
                     alias_str = f" (별칭: {a['alias']})" if a.get("alias") else ""
                     lines.append(f"  • {a['title'][:60]}{alias_str}")
-            if result["updated"]:
-                lines.append(f"\nURL 교체 제안 {len(result['updated'])}건:")
-                for u in result["updated"][:10]:
-                    lines.append(f"  • {u['title'][:40]} → 실주문 URL")
-            if result["pending"]:
-                lines.append(f"\n승인 대기 {len(result['pending'])}건 — 아래 매핑 메시지의 [✅ 매핑 승인] / [❌ 매핑 거절] 버튼으로 처리하세요.")
-                for p in result["pending"][:10]:
-                    lines.append(f"  • #{p['id']} [{p.get('action', '?')}] {p.get('title', '')[:50]}")
             _send_discord_webhook("\n".join(lines))
         except Exception:
             logger.exception("[Matcher:Sync] 디스코드 요약 알림 실패")

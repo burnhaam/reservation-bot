@@ -27,7 +27,7 @@ from modules.config_loader import load_config
 logger = logging.getLogger(__name__)
 
 
-# 연속 실패 카운터: 3회 이상 연속 실패 시 영구 1회 카카오 알림.
+# 연속 실패 카운터: 3회 이상 연속 실패 시 영구 1회 Discord 알림.
 # Task Scheduler가 프로세스를 매번 새로 띄우므로 파일 기반 상태 필요.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PARSER_STATE_PATH = _PROJECT_ROOT / "data" / "parser_failure_state.json"
@@ -55,7 +55,7 @@ def _save_parser_state(state: dict) -> None:
 
 
 def _record_parser_outcome(success: bool, err_msg: str = "") -> None:
-    """성공 시 카운터 리셋, 실패 시 증가 + 임계치 도달 시 카카오 알림.
+    """성공 시 카운터 리셋, 실패 시 증가 + 임계치 도달 시 Discord 알림.
 
     알림은 dedup_key='gemini_parse_failed'로 영구 1회. 임계치 회복 후 다시 연속
     실패가 누적되면 notify_state.json의 해당 키를 수동 제거해야 재발송 가능.
